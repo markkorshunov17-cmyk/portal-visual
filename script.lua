@@ -1,12 +1,24 @@
 -- language: Lua
 -- target: Roblox client (Portal Tower Defense)
--- AFK farm v13 — full build: costs, upgrade prices, cash-aware, GUI
+-- PART 1/2 — core, config, state, GUI. Paste first, then PART 2.
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local VirtualUser       = game:GetService("VirtualUser")
 local LocalPlayer       = Players.LocalPlayer
-local PlayerGui         = LocalPlayer:WaitForChild("PlayerGui")
+
+local PlayerGui
+do
+    local ok, gui = pcall(function()
+        return LocalPlayer:WaitForChild("PlayerGui", 30)
+    end)
+    if ok and gui then
+        PlayerGui = gui
+    else
+        warn("[AFK] PlayerGui не найден за 30 сек — меню не построить")
+        return
+    end
+end
 
 -- ============================================================
 -- CONFIG
@@ -29,12 +41,9 @@ local CONFIG = {
     TowerWaitPoll    = 0.5,
     ClickMissLimit   = 15,
     CashPoll         = 0.5,
-    UpgradeCashWait  = 60,   -- максимум секунд ждать деньги на апгрейд
+    UpgradeCashWait  = 60,
 }
 
--- ============================================================
--- ЦЕНЫ ПОСТРОЙКИ (точные, от тебя)
--- ============================================================
 local COST = {
     ["Jerry"]         = 250,
     ["Buff Turkey"]   = 800,
@@ -42,27 +51,16 @@ local COST = {
     ["Space Cruiser"] = 2200,
 }
 
--- ============================================================
--- ЦЕНЫ АПГРЕЙДА (стоимость каждого шага; nil = неизвестно)
--- Jerry: 1→2 = 450, 2→3 = 1100, 3→4 = 2400, 4→5 = 4800
--- ============================================================
 local UPGRADE_COST = {
     ["Jerry"] = { 450, 1100, 2400, 4800 },
-    -- ["Buff Turkey"]   = { ... },   -- скинь через SimpleSpy — добавлю
-    -- ["President"]     = { ... },
-    -- ["Space Cruiser"] = { ... },
 }
 
--- Возвращает стоимость следующего уровня или nil
 local function NextUpgradeCost(towerName, currentLevel)
     local list = UPGRADE_COST[towerName]
     if not list then return nil end
-    return list[currentLevel]  -- currentLevel: 1 = только поставлен
+    return list[currentLevel]
 end
 
--- ============================================================
--- РАСПИСАНИЕ
--- ============================================================
 local SCHEDULE = {
     { t = 0,   name = "Jerry",        pos = Vector3.new(115.77935791015625, 7.954591751098633, -46.52529525756836) },
     { t = 0,   name = "Jerry",        pos = Vector3.new(113.5140380859375,  7.933708190917969, -49.838958740234375) },
@@ -89,25 +87,154 @@ local MatchStart = 0
 local function Elapsed() return os.clock() - MatchStart end
 
 -- ============================================================
--- SCHEDULE VALIDATION
+-- CASH
 -- ============================================================
-local function ValidateSchedule()
-    for i, e in ipairs(SCHEDULE) do
-        if type(e.name) ~= "string" or e.name == "" then
-            return false, ("SCHEDULE[%d].name пустое"):format(i)
-        end
-        if typeof(e.pos) ~= "Vector3" then
-            return false, ("SCHEDULE[%d].pos не Vector3"):format(i)
-        end
-        if type(e.t) ~= "number" or e.t < 0 then
-            return false, ("SCHEDULE[%d].t не число"):format(i)
-        end
-        if not COST[e.name] then
-            return false, ("SCHEDULE[%d]: нет цены для %s"):format(i, e.name)
+local CashStat = nil
+local function FindCash()
+    local ls = LocalPlayer:FindFirstChild("leaderstats")
+    if not ls then return nil end
+    for _, n in ipairs(CONFIG.MoneyNames) do
+        local s = ls:FindFirstChild(n)
+        if s and (s:IsA("IntValue") or s:IsA("NumberValue")) then return s end
+    end
+    return nil
+end
+local function Cash()
+    if not CashStat or not CashStat.Parent then CashStat = FindCash() end
+    return CashStat and CashStat.Value or nil
+end
+
+-- ============================================================
+-- GUI
+-- ============================================================
+local RefreshButton
+local BuildGui
+
+BuildGui = function()
+    local old = PlayerGui:FindFirstChild("PTD_AFK_Menu")
+    if old then old:Destroy() end
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "PTD_AFK_Menu"; gui.ResetOnSpawn = false; gui.Parent = PlayerGui
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(0, 300, 0, 220); frame.Position = UDim2.new(0, 20, 0, 20)
+    frame.BackgroundColor3 = Color3.fromRGB(14, 14, 18); frame.BorderSizePixel = 0
+    frame.Active = true; frame.Draggable = true; frame.Parent = gui
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
+    local stroke = Instance.new("UIStroke", frame)
+    stroke.Color = Color3.fromRGB(0, 200, 100); stroke.Thickness = 1; stroke.Transparency = 0.4
+
+    local title = Instance.new("TextLabel", frame)
+    title.Size = UDim2.new(1, -16, 0, 26); title.Position = UDim2.new(0, 10, 0, 6)
+    title.BackgroundTransparency = 1; title.Text = "PTD AFK FARM (core)"
+    title.TextColor3 = Color3.fromRGB(0, 220, 110); title.Font = Enum.Font.GothamBold
+    title.TextSize = 14; title.TextXAlignment = Enum.TextXAlignment.Left
+
+    local btn = Instance.new("TextButton", frame)
+    btn.Size = UDim2.new(1, -32, 0, 36); btn.Position = UDim2.new(0, 16, 0, 36)
+    btn.BorderSizePixel = 0; btn.Text = "▶  ЗАПУСТИТЬ"; btn.TextColor3 = Color3.new(1,1,1)
+    btn.Font = Enum.Font.GothamBold; btn.TextSize = 14; btn.AutoButtonColor = false
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+
+    local timer = Instance.new("TextLabel", frame)
+    timer.Size = UDim2.new(1, -32, 0, 32); timer.Position = UDim2.new(0, 16, 0, 78)
+    timer.BackgroundTransparency = 1; timer.Text = "--"
+    timer.TextColor3 = Color3.fromRGB(255, 200, 80); timer.Font = Enum.Font.GothamBold
+    timer.TextSize = 20; timer.TextXAlignment = Enum.TextXAlignment.Left
+
+    local detail = Instance.new("TextLabel", frame)
+    detail.Size = UDim2.new(1, -32, 0, 18); detail.Position = UDim2.new(0, 16, 0, 112)
+    detail.BackgroundTransparency = 1; detail.Text = "ВЫКЛ"
+    detail.TextColor3 = Color3.fromRGB(180, 180, 180); detail.Font = Enum.Font.Gotham
+    detail.TextSize = 12; detail.TextXAlignment = Enum.TextXAlignment.Left
+
+    local cash = Instance.new("TextLabel", frame)
+    cash.Size = UDim2.new(1, -32, 0, 18); cash.Position = UDim2.new(0, 16, 0, 132)
+    cash.BackgroundTransparency = 1; cash.Text = "cash: --"
+    cash.TextColor3 = Color3.fromRGB(110, 190, 255); cash.Font = Enum.Font.Gotham
+    cash.TextSize = 12; cash.TextXAlignment = Enum.TextXAlignment.Left
+
+    local phase = Instance.new("TextLabel", frame)
+    phase.Size = UDim2.new(1, -32, 0, 16); phase.Position = UDim2.new(0, 16, 0, 152)
+    phase.BackgroundTransparency = 1; phase.Text = ""
+    phase.TextColor3 = Color3.fromRGB(120, 120, 120); phase.Font = Enum.Font.Gotham
+    phase.TextSize = 11; phase.TextXAlignment = Enum.TextXAlignment.Left
+
+    local err = Instance.new("TextLabel", frame)
+    err.Size = UDim2.new(1, -32, 0, 40); err.Position = UDim2.new(0, 16, 0, 172)
+    err.BackgroundTransparency = 1; err.Text = ""
+    err.TextColor3 = Color3.fromRGB(220, 80, 80); err.Font = Enum.Font.Gotham
+    err.TextSize = 11; err.TextXAlignment = Enum.TextXAlignment.Left; err.TextWrapped = true
+
+    RefreshButton = function()
+        if State.running then
+            btn.Text = "■  ОСТАНОВИТЬ"; btn.BackgroundColor3 = Color3.fromRGB(170, 45, 45)
+        else
+            btn.Text = "▶  ЗАПУСТИТЬ"; btn.BackgroundColor3 = Color3.fromRGB(0, 150, 75)
         end
     end
-    return true, nil
+
+    btn.MouseButton1Click:Connect(function()
+        local Start = _G.PTD_Start
+        local Stop  = _G.PTD_Stop
+        if not Start or not Stop then
+            warn("[AFK] логика не загружена — вставь PART 2")
+            return
+        end
+        if State.running then Stop() else Start() end
+        RefreshButton()
+    end)
+
+    task.spawn(function()
+        while gui.Parent do
+            if State.timerEnd then
+                local left = State.timerEnd - os.clock()
+                timer.Text = left > 0
+                    and ("%.1f с → %s"):format(left, State.timerName)
+                    or ("0.0 с → " .. State.timerName)
+            else timer.Text = "--" end
+            detail.Text = State.detail ~= "" and State.detail or "ВЫКЛ"
+            phase.Text = State.phase ~= "idle" and ("фаза: " .. State.phase) or ""
+            local c = Cash(); cash.Text = "cash: " .. tostring(c or "--")
+            err.Text = State.error
+            task.wait(0.15)
+        end
+    end)
+
+    RefreshButton()
+    return gui
 end
+
+local built, buildErr = pcall(BuildGui)
+if not built then
+    warn("[AFK] BuildGui упал: " .. tostring(buildErr))
+else
+    print("[AFK] PART 1: меню построено. Вставь PART 2 для фарма.")
+end
+-- language: Lua
+-- target: Roblox client (Portal Tower Defense)
+-- PART 2/2 — remotes, placement, upgrade, click loop. Paste after PART 1.
+
+if not _G.PTD_State then
+    warn("[AFK] PART 1 не загружена — сначала вставь core")
+    return
+end
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local VirtualUser = game:GetService("VirtualUser")
+local LocalPlayer = Players.LocalPlayer
+
+local CONFIG         = _G.PTD_CONFIG
+local COST           = _G.PTD_COST
+local NextUpgradeCost = _G.PTD_NextUpgradeCost
+local SCHEDULE       = _G.PTD_SCHEDULE
+local State          = _G.PTD_State
+local SetPhase       = _G.PTD_SetPhase
+local Elapsed        = _G.PTD_Elapsed
+local Cash           = _G.PTD_Cash
+local PlayerGui      = _G.PTD_PlayerGui
+local RefreshButton  = _G.PTD_RefreshButton
 
 -- ============================================================
 -- REMOTES
@@ -147,24 +274,18 @@ local function WaitForRemotes(timeoutSec)
 end
 
 -- ============================================================
--- CASH
+-- VOTE
 -- ============================================================
-local CashStat = nil
-local function FindCash()
-    local ls = LocalPlayer:FindFirstChild("leaderstats")
-    if not ls then return nil end
-    for _, n in ipairs(CONFIG.MoneyNames) do
-        local s = ls:FindFirstChild(n)
-        if s and (s:IsA("IntValue") or s:IsA("NumberValue")) then return s end
-    end
-    return nil
-end
-local function Cash()
-    if not CashStat or not CashStat.Parent then CashStat = FindCash() end
-    return CashStat and CashStat.Value or nil
+local function Vote()
+    local r = Remote("DifficultyVote")
+    if not r then return false end
+    pcall(function() r:FireServer(CONFIG.Difficulty) end)
+    return true
 end
 
--- Ждём cash >= need, обновляя detail. true = дождались.
+-- ============================================================
+-- CASH WAIT
+-- ============================================================
 local function WaitForCash(need, label)
     while State.running do
         local c = Cash()
@@ -176,16 +297,6 @@ local function WaitForCash(need, label)
 end
 
 -- ============================================================
--- VOTE
--- ============================================================
-local function Vote()
-    local r = Remote("DifficultyVote")
-    if not r then return false end
-    pcall(function() r:FireServer(CONFIG.Difficulty) end)
-    return true
-end
-
--- ============================================================
 -- PLACE
 -- ============================================================
 local function PlaceOne(entry)
@@ -194,8 +305,6 @@ local function PlaceOne(entry)
     if not State.running then return false end
 
     local cost = COST[entry.name] or 0
-
-    -- ждём нужную сумму перед вызовом
     if not WaitForCash(cost, entry.name) then return false end
     if not State.running then return false end
 
@@ -303,7 +412,6 @@ local function WaitForAnyTower()
     return false
 end
 
--- Определяем базовое имя юнита из имени объекта
 local function BaseUnitName(towerName)
     for _, suffix in ipairs({ "Space Cruiser", "Buff Turkey", "President", "Jerry" }) do
         if towerName:sub(-#suffix) == suffix then return suffix end
@@ -394,7 +502,7 @@ local function FindStartButton()
     end
     CachedButton = nil
     for _, gui in ipairs(PlayerGui:GetChildren()) do
-        if gui:IsA("ScreenGui") then
+        if gui:IsA("ScreenGui") and gui.Name ~= "PTD_AFK_Menu" then
             for _, obj in ipairs(gui:GetDescendants()) do
                 if obj:IsA("TextButton") and obj.Visible then
                     local txt = obj.Text:lower()
@@ -433,13 +541,6 @@ local FarmThread = nil
 
 local function Loop()
     State.error = ""
-
-    local schedOk, schedErr = ValidateSchedule()
-    if not schedOk then
-        State.error = "SCHEDULE: " .. schedErr
-        State.running = false
-        return
-    end
 
     local ok, err = WaitForRemotes(CONFIG.RemotesWait)
     if not ok then
@@ -488,7 +589,7 @@ end
 local function Start()
     if State.running then return end
     State.running = true; State.error = ""
-    MatchStart = os.clock()
+    _G.PTD_MatchStart = os.clock()
     CashStat = FindCash()
     print("[AFK] cash: " .. tostring(CashStat and CashStat.Value))
     FarmThread = task.spawn(Loop)
@@ -502,41 +603,8 @@ local function Stop()
     SetPhase("idle", "ВЫКЛ")
 end
 
--- ============================================================
--- GUI
--- ============================================================
-local function BuildGui()
-    local old = PlayerGui:FindFirstChild("PTD_AFK_Menu")
-    if old then old:Destroy() end
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "PTD_AFK_Menu"; gui.ResetOnSpawn = false; gui.Parent = PlayerGui
+-- экспорт для PART 1
+_G.PTD_Start = Start
+_G.PTD_Stop  = Stop
 
-    local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 300, 0, 220); frame.Position = UDim2.new(0, 20, 0, 20)
-    frame.BackgroundColor3 = Color3.fromRGB(14, 14, 18); frame.BorderSizePixel = 0
-    frame.Active = true; frame.Draggable = true; frame.Parent = gui
-    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
-    local stroke = Instance.new("UIStroke", frame)
-    stroke.Color = Color3.fromRGB(0, 200, 100); stroke.Thickness = 1; stroke.Transparency = 0.4
-
-    local title = Instance.new("TextLabel", frame)
-    title.Size = UDim2.new(1, -16, 0, 26); title.Position = UDim2.new(0, 10, 0, 6)
-    title.BackgroundTransparency = 1; title.Text = "PTD AFK FARM v13"
-    title.TextColor3 = Color3.fromRGB(0, 220, 110); title.Font = Enum.Font.GothamBold
-    title.TextSize = 14; title.TextXAlignment = Enum.TextXAlignment.Left
-
-    local btn = Instance.new("TextButton", frame)
-    btn.Size = UDim2.new(1, -32, 0, 36); btn.Position = UDim2.new(0, 16, 0, 36)
-    btn.BorderSizePixel = 0; btn.Text = "▶  ЗАПУСТИТЬ"; btn.TextColor3 = Color3.new(1,1,1)
-    btn.Font = Enum.Font.GothamBold; btn.TextSize = 14; btn.AutoButtonColor = false
-    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
-
-    local timer = Instance.new("TextLabel", frame)
-    timer.Size = UDim2.new(1, -32, 0, 32); timer.Position = UDim2.new(0, 16, 0, 78)
-    timer.BackgroundTransparency = 1; timer.Text = "--"
-    timer.TextColor3 = Color3.fromRGB(255, 200, 80); timer.Font = Enum.Font.GothamBold
-    timer.TextSize = 20; timer.TextXAlignment = Enum.TextXAlignment.Left
-
-    local detail = Instance.new("TextLabel", frame)
-    detail.Size = UDim2.new(1, -32, 0, 18); detail.Position = UDim2.new(0, 16, 0, 112)
-    detail.Backgr
+print("[AFK] PART 2: логика загружена. Жми ЗАПУСТИТЬ в меню.")
