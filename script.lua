@@ -1,204 +1,269 @@
+-- language: Lua
+-- target: Roblox client (Portal Tower Defense by RMTD Development)
+-- single-file AFK farm with GUI toggle button
+-- place in executor, run once, use menu button to start/stop
 
--- PORTAL HUB v2.0
--- Local visual prototype for Roblox Studio
--- Place as a LocalScript in StarterPlayerScripts
-
-local Players = game:GetService("Players")
-local player = Players.LocalPlayer
-
-local old = player.PlayerGui:FindFirstChild("PortalHub")
-if old then old:Destroy() end
-
-local gui = Instance.new("ScreenGui")
-gui.Name = "PortalHub"
-gui.ResetOnSpawn = false
-gui.Parent = player.PlayerGui
-
-local function create(class, props, parent)
-    local obj = Instance.new(class)
-    for k, v in pairs(props) do
-        obj[k] = v
-    end
-    obj.Parent = parent
-    return obj
-end
-
-local main = create("Frame", {
-    Size = UDim2.fromOffset(340, 440),
-    Position = UDim2.new(0.5, -170, 0.5, -220),
-    BackgroundColor3 = Color3.fromRGB(20, 16, 31),
-    BorderSizePixel = 0
-}, gui)
-
-create("UICorner", {
-    CornerRadius = UDim.new(0, 14)
-}, main)
-
-local title = create("TextLabel", {
-    Size = UDim2.new(1, 0, 0, 48),
-    BackgroundColor3 = Color3.fromRGB(100, 55, 170),
-    Text = "PORTAL HUB",
-    TextColor3 = Color3.new(1, 1, 1),
-    TextSize = 23,
-    Font = Enum.Font.GothamBold
-}, main)
-
-local coins = 0
-local inventory = {}
-local selected = nil
-
--- Only provisional names; replace with verified unit names.
-local units = {
-    "Docs",
-    "Milos",
-    "News Milo",
-    "Rick",
-    "Evil Morty"
+-- ============================================================
+-- CONFIG — правь только это, если имена ремоутов другие
+-- ============================================================
+local CONFIG = {
+    Remotes = {
+        SummonUnit  = "SummonUnit",
+        UpgradeUnit = "UpgradeUnit",
+        StartWave   = "StartWave",
+    },
+    UnitsFolder     = "Units",
+    SummonDelay     = 0.8,
+    UpgradeDelay    = 1.2,
+    WaveDelay       = 2.0,
+    AntiAFKDelay    = 60,
+    UpgradePriority = "Cheapest", -- "Cheapest" | "MostExpensive" | "First"
 }
 
-local coinInput = create("TextBox", {
-    Size = UDim2.new(1, -30, 0, 38),
-    Position = UDim2.fromOffset(15, 65),
-    BackgroundColor3 = Color3.fromRGB(42, 32, 58),
-    TextColor3 = Color3.new(1, 1, 1),
-    PlaceholderText = "Enter visual coin amount",
-    Text = "",
-    TextSize = 15,
-    Font = Enum.Font.Gotham
-}, main)
+-- ============================================================
+-- SERVICES & STATE
+-- ============================================================
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local VirtualUser       = game:GetService("VirtualUser")
+local LocalPlayer       = Players.LocalPlayer
+local PlayerGui         = LocalPlayer:WaitForChild("PlayerGui")
 
-local coinLabel = create("TextLabel", {
-    Size = UDim2.new(1, -30, 0, 30),
-    Position = UDim2.fromOffset(15, 105),
-    BackgroundTransparency = 1,
-    Text = "Visual Coins: 0",
-    TextColor3 = Color3.fromRGB(210, 180, 255),
-    TextSize = 17,
-    Font = Enum.Font.GothamBold,
-    TextXAlignment = Enum.TextXAlignment.Left
-}, main)
+local RemoteCache = {}
+local FarmRunning = false
+local FarmThread  = nil
 
-local coinButton = create("TextButton", {
-    Size = UDim2.new(1, -30, 0, 35),
-    Position = UDim2.fromOffset(15, 140),
-    BackgroundColor3 = Color3.fromRGB(100, 55, 170),
-    Text = "SET VISUAL COINS",
-    TextColor3 = Color3.new(1, 1, 1),
-    TextSize = 14,
-    Font = Enum.Font.GothamBold
-}, main)
-
-coinButton.MouseButton1Click:Connect(function()
-    local amount = tonumber(coinInput.Text)
-    if amount and amount >= 0 then
-        coins = math.floor(amount)
-        coinLabel.Text = "Visual Coins: " .. coins
+-- ============================================================
+-- REMOTE DISCOVERY
+-- ============================================================
+local function FindRemote(name)
+    if RemoteCache[name] then return RemoteCache[name] end
+    local r = ReplicatedStorage:FindFirstChild(name, true)
+    if r and (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then
+        RemoteCache[name] = r
+        return r
     end
-end)
-
-local search = create("TextBox", {
-    Size = UDim2.new(1, -30, 0, 36),
-    Position = UDim2.fromOffset(15, 190),
-    BackgroundColor3 = Color3.fromRGB(42, 32, 58),
-    TextColor3 = Color3.new(1, 1, 1),
-    PlaceholderText = "Search unit...",
-    Text = "",
-    TextSize = 14
-}, main)
-
-local unitList = create("ScrollingFrame", {
-    Size = UDim2.new(1, -30, 0, 100),
-    Position = UDim2.fromOffset(15, 232),
-    BackgroundColor3 = Color3.fromRGB(30, 24, 43),
-    BorderSizePixel = 0,
-    ScrollBarThickness = 4,
-    CanvasSize = UDim2.fromOffset(0, #units * 36)
-}, main)
-
-local layout = create("UIListLayout", {
-    Padding = UDim.new(0, 3)
-}, unitList)
-
-local function refreshUnits()
-    for _, child in ipairs(unitList:GetChildren()) do
-        if child:IsA("TextButton") then
-            child:Destroy()
-        end
-    end
-
-    local count = 0
-
-    for _, name in ipairs(units) do
-        if string.find(string.lower(name), string.lower(search.Text), 1, true) then
-            count += 1
-
-            local button = create("TextButton", {
-                Size = UDim2.new(1, -6, 0, 32),
-                BackgroundColor3 = Color3.fromRGB(75, 48, 110),
-                Text = name,
-                TextColor3 = Color3.new(1, 1, 1),
-                TextSize = 14,
-                Font = Enum.Font.Gotham
-            }, unitList)
-
-            button.MouseButton1Click:Connect(function()
-                selected = name
-                search.Text = name
-            end)
-        end
-    end
-
-    unitList.CanvasSize = UDim2.fromOffset(0, count * 35)
+    warn(("[AFK] Remote не найден: %s — проверь CONFIG.Remotes через Dex"):format(name))
+    return nil
 end
 
-search:GetPropertyChangedSignal("Text"):Connect(refreshUnits)
-refreshUnits()
+local function Fire(remoteName, ...)
+    local r = FindRemote(remoteName)
+    if not r then return false end
+    local ok, err = pcall(function(...)
+        if r:IsA("RemoteFunction") then
+            return r:InvokeServer(...)
+        else
+            r:FireServer(...)
+        end
+    end, ...)
+    if not ok then
+        warn(("[AFK] Fire %s: %s"):format(remoteName, tostring(err)))
+    end
+    return ok
+end
 
-local giveButton = create("TextButton", {
-    Size = UDim2.new(1, -30, 0, 35),
-    Position = UDim2.fromOffset(15, 340),
-    BackgroundColor3 = Color3.fromRGB(115, 65, 190),
-    Text = "GIVE",
-    TextColor3 = Color3.new(1, 1, 1),
-    TextSize = 16,
-    Font = Enum.Font.GothamBold
-}, main)
+-- ============================================================
+-- UNIT DISCOVERY
+-- ============================================================
+local function GetMyUnits()
+    local folder = workspace:FindFirstChild(CONFIG.UnitsFolder)
+    if not folder then return {} end
+    local out = {}
+    for _, obj in ipairs(folder:GetChildren()) do
+        local owner = obj:GetAttribute("Owner") or obj:GetAttribute("Player")
+        if owner == LocalPlayer or owner == LocalPlayer.Name then
+            table.insert(out, obj)
+            continue
+        end
+        if obj:FindFirstChildOfClass("Humanoid") and not obj.Name:lower():find("enemy") then
+            table.insert(out, obj)
+        end
+    end
+    return out
+end
 
-local inventoryLabel = create("TextLabel", {
-    Size = UDim2.new(1, -30, 0, 45),
-    Position = UDim2.fromOffset(15, 380),
-    BackgroundTransparency = 1,
-    Text = "Visual Inventory: Empty",
-    TextColor3 = Color3.new(1, 1, 1),
-    TextSize = 13,
-    Font = Enum.Font.Gotham,
-    TextWrapped = true
-}, main)
+-- ============================================================
+-- FARM ACTIONS
+-- ============================================================
+local function TrySummon()
+    Fire(CONFIG.Remotes.SummonUnit)
+end
 
-giveButton.MouseButton1Click:Connect(function()
-    if not selected then
-        inventoryLabel.Text = "Select a unit first!"
-        return
+local function TryUpgrade()
+    local units = GetMyUnits()
+    if #units == 0 then return end
+
+    if CONFIG.UpgradePriority ~= "First" then
+        table.sort(units, function(a, b)
+            local ca = a:GetAttribute("Cost") or a:GetAttribute("Value") or 0
+            local cb = b:GetAttribute("Cost") or b:GetAttribute("Value") or 0
+            if CONFIG.UpgradePriority == "MostExpensive" then
+                return ca > cb
+            else
+                return ca < cb
+            end
+        end)
     end
 
-    table.insert(inventory, selected)
+    Fire(CONFIG.Remotes.UpgradeUnit, units[1])
+end
 
-    inventoryLabel.Text =
-        "Visual Inventory: " ..
-        table.concat(inventory, ", ")
-end)
+local function TryStartWave()
+    Fire(CONFIG.Remotes.StartWave)
+end
 
-local close = create("TextButton", {
-    Size = UDim2.fromOffset(30, 30),
-    Position = UDim2.new(1, -35, 0, 9),
-    BackgroundColor3 = Color3.fromRGB(65, 35, 95),
-    Text = "X",
-    TextColor3 = Color3.new(1, 1, 1),
-    TextSize = 16
-}, main)
+-- ============================================================
+-- ANTI-AFK
+-- ============================================================
+local function StartAntiAFK()
+    task.spawn(function()
+        while true do
+            task.wait(CONFIG.AntiAFKDelay)
+            pcall(function()
+                VirtualUser:CaptureController()
+                VirtualUser:Button1Down(Vector2.new(0, 0))
+                VirtualUser:Button1Up(Vector2.new(0, 0))
+            end)
+        end
+    end)
+end
 
-close.MouseButton1Click:Connect(function()
-    gui.Enabled = false
-end)
+-- ============================================================
+-- FARM LOOP
+-- ============================================================
+local function FarmLoop()
+    while FarmRunning do
+        TrySummon()
+        task.wait(CONFIG.SummonDelay)
+        if not FarmRunning then break end
 
-print("PORTAL HUB v2.0 loaded")
+        TryUpgrade()
+        task.wait(CONFIG.UpgradeDelay)
+        if not FarmRunning then break end
+
+        TryStartWave()
+        task.wait(CONFIG.WaveDelay)
+    end
+end
+
+local function StartFarm()
+    if FarmRunning then return end
+    FarmRunning = true
+    FarmThread = task.spawn(FarmLoop)
+end
+
+local function StopFarm()
+    FarmRunning = false
+    if FarmThread then
+        task.cancel(FarmThread)
+        FarmThread = nil
+    end
+end
+
+-- ============================================================
+-- GUI
+-- ============================================================
+local function BuildGui()
+    local old = PlayerGui:FindFirstChild("PTD_AFK_Menu")
+    if old then old:Destroy() end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "PTD_AFK_Menu"
+    gui.ResetOnSpawn = false
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.Parent = PlayerGui
+
+    local frame = Instance.new("Frame")
+    frame.Name = "Main"
+    frame.Size = UDim2.new(0, 260, 0, 120)
+    frame.Position = UDim2.new(0, 20, 0, 20)
+    frame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+    frame.BorderSizePixel = 0
+    frame.Active = true
+    frame.Draggable = true
+    frame.Parent = gui
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = frame
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(0, 200, 100)
+    stroke.Thickness = 1
+    stroke.Transparency = 0.4
+    stroke.Parent = frame
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -16, 0, 28)
+    title.Position = UDim2.new(0, 8, 0, 6)
+    title.BackgroundTransparency = 1
+    title.Text = "PTD AFK Farm"
+    title.TextColor3 = Color3.fromRGB(0, 220, 110)
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 16
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = frame
+
+    local toggleBtn = Instance.new("TextButton")
+    toggleBtn.Name = "ToggleFarm"
+    toggleBtn.Size = UDim2.new(1, -32, 0, 42)
+    toggleBtn.Position = UDim2.new(0, 16, 0, 48)
+    toggleBtn.BackgroundColor3 = Color3.fromRGB(0, 140, 70)
+    toggleBtn.BorderSizePixel = 0
+    toggleBtn.Text = "▶  ЗАПУСТИТЬ ФАРМ"
+    toggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    toggleBtn.Font = Enum.Font.GothamBold
+    toggleBtn.TextSize = 15
+    toggleBtn.AutoButtonColor = false
+    toggleBtn.Parent = frame
+
+    local btnCorner = Instance.new("UICorner")
+    btnCorner.CornerRadius = UDim.new(0, 6)
+    btnCorner.Parent = toggleBtn
+
+    local status = Instance.new("TextLabel")
+    status.Name = "Status"
+    status.Size = UDim2.new(1, -32, 0, 18)
+    status.Position = UDim2.new(0, 16, 0, 96)
+    status.BackgroundTransparency = 1
+    status.Text = "●  ОСТАНОВЛЕН"
+    status.TextColor3 = Color3.fromRGB(180, 60, 60)
+    status.Font = Enum.Font.Gotham
+    status.TextSize = 12
+    status.TextXAlignment = Enum.TextXAlignment.Left
+    status.Parent = frame
+
+    local function Refresh()
+        if FarmRunning then
+            toggleBtn.Text = "■  ОСТАНОВИТЬ ФАРМ"
+            toggleBtn.BackgroundColor3 = Color3.fromRGB(160, 50, 50)
+            status.Text = "●  РАБОТАЕТ"
+            status.TextColor3 = Color3.fromRGB(0, 220, 110)
+        else
+            toggleBtn.Text = "▶  ЗАПУСТИТЬ ФАРМ"
+            toggleBtn.BackgroundColor3 = Color3.fromRGB(0, 140, 70)
+            status.Text = "●  ОСТАНОВЛЕН"
+            status.TextColor3 = Color3.fromRGB(180, 60, 60)
+        end
+    end
+
+    toggleBtn.MouseButton1Click:Connect(function()
+        if FarmRunning then
+            StopFarm()
+        else
+            StartFarm()
+        end
+        Refresh()
+    end)
+
+    Refresh()
+    return gui
+end
+
+-- ============================================================
+-- BOOT
+-- ============================================================
+StartAntiAFK()
+BuildGui()
+print("[AFK] PTD Farm загружен. Кнопка в меню. Если warn про Remote — правь CONFIG.Remotes.")
