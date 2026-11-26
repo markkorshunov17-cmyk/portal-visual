@@ -1,269 +1,168 @@
 -- language: Lua
--- target: Roblox client (Portal Tower Defense by RMTD Development)
--- single-file AFK farm with GUI toggle button
--- place in executor, run once, use menu button to start/stop
+-- target: Roblox client (Portal Tower Defense)
+-- AFK farm — vote + place (Jerry first) + upgrade-to-max + auto-click start wave
+-- manual rejoin: He restarts the script in each new match
 
--- ============================================================
--- CONFIG — правь только это, если имена ремоутов другие
--- ============================================================
-local CONFIG = {
-    Remotes = {
-        SummonUnit  = "SummonUnit",
-        UpgradeUnit = "UpgradeUnit",
-        StartWave   = "StartWave",
-    },
-    UnitsFolder     = "Units",
-    SummonDelay     = 0.8,
-    UpgradeDelay    = 1.2,
-    WaveDelay       = 2.0,
-    AntiAFKDelay    = 60,
-    UpgradePriority = "Cheapest", -- "Cheapest" | "MostExpensive" | "First"
-}
-
--- ============================================================
--- SERVICES & STATE
--- ============================================================
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local VirtualUser       = game:GetService("VirtualUser")
 local LocalPlayer       = Players.LocalPlayer
 local PlayerGui         = LocalPlayer:WaitForChild("PlayerGui")
 
-local RemoteCache = {}
-local FarmRunning = false
-local FarmThread  = nil
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+local PlaceTower     = Remotes:WaitForChild("PlaceTower")
+local UpgradeTower   = Remotes:WaitForChild("UpgradeTower")
+local DifficultyVote = Remotes:WaitForChild("DifficultyVote")
+local TowersFolder   = workspace:WaitForChild("Towers")
 
 -- ============================================================
--- REMOTE DISCOVERY
+-- CONFIG
 -- ============================================================
-local function FindRemote(name)
-    if RemoteCache[name] then return RemoteCache[name] end
-    local r = ReplicatedStorage:FindFirstChild(name, true)
-    if r and (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then
-        RemoteCache[name] = r
-        return r
-    end
-    warn(("[AFK] Remote не найден: %s — проверь CONFIG.Remotes через Dex"):format(name))
-    return nil
+local CONFIG = {
+    Difficulty      = "Nightmare",
+    PlaceDelay      = 0.3,
+    UpgradeDelay    = 0.15,
+    UpgradeMaxTries = 50,
+    ClickInterval   = 5,
+    StartTexts      = { "start", "начать", "wave", "волна", "next", "далее", "play", "играть" },
+}
+
+local PLACEMENTS = {
+    { name = "Jerry",        pos = Vector3.new(115.77935791015625, 7.954591751098633, -46.52529525756836), rot = 0 },
+    { name = "Jerry",        pos = Vector3.new(113.5140380859375,  7.933708190917969, -49.838958740234375), rot = 0 },
+    { name = "President",    pos = Vector3.new(109.55278778076172, 7.922641754150391, -46.534759521484375), rot = 0 },
+    { name = "President",    pos = Vector3.new(109.61953735351562, 7.935300827026367, -50.340065002441406), rot = 0 },
+    { name = "Buff Turkey",  pos = Vector3.new(105.41456604003906, 7.935329437255859, -50.34072494506836), rot = 0 },
+    { name = "Space Cruiser", pos = Vector3.new(131.7823028564453, 8.261308670043945, -51.3819694519043), rot = 0 },
+}
+
+-- ============================================================
+-- VOTE
+-- ============================================================
+local function VoteDifficulty(diff)
+    local ok, err = pcall(function()
+        return DifficultyVote:FireServer(diff)
+    end)
+    if not ok then warn("[AFK] DifficultyVote: " .. tostring(err)) end
 end
 
-local function Fire(remoteName, ...)
-    local r = FindRemote(remoteName)
-    if not r then return false end
-    local ok, err = pcall(function(...)
-        if r:IsA("RemoteFunction") then
-            return r:InvokeServer(...)
-        else
-            r:FireServer(...)
-        end
-    end, ...)
-    if not ok then
-        warn(("[AFK] Fire %s: %s"):format(remoteName, tostring(err)))
+-- ============================================================
+-- PLACE
+-- ============================================================
+local function PlaceAll()
+    local placed = 0
+    for _, e in ipairs(PLACEMENTS) do
+        local ok, err = pcall(function()
+            return PlaceTower:InvokeServer(e.name, e.pos, e.rot or 0)
+        end)
+        if ok then placed = placed + 1
+        else warn(("[AFK] PlaceTower %s: %s"):format(e.name, tostring(err))) end
+        task.wait(CONFIG.PlaceDelay)
     end
-    return ok
+    print(("[AFK] Расставлено: %d/%d"):format(placed, #PLACEMENTS))
 end
 
 -- ============================================================
--- UNIT DISCOVERY
+-- UPGRADE
 -- ============================================================
-local function GetMyUnits()
-    local folder = workspace:FindFirstChild(CONFIG.UnitsFolder)
-    if not folder then return {} end
+local function FindTowersBySuffix(suffix)
     local out = {}
-    for _, obj in ipairs(folder:GetChildren()) do
-        local owner = obj:GetAttribute("Owner") or obj:GetAttribute("Player")
-        if owner == LocalPlayer or owner == LocalPlayer.Name then
-            table.insert(out, obj)
-            continue
-        end
-        if obj:FindFirstChildOfClass("Humanoid") and not obj.Name:lower():find("enemy") then
+    for _, obj in ipairs(TowersFolder:GetChildren()) do
+        if obj.Name:sub(-#suffix) == suffix then
             table.insert(out, obj)
         end
     end
     return out
 end
 
--- ============================================================
--- FARM ACTIONS
--- ============================================================
-local function TrySummon()
-    Fire(CONFIG.Remotes.SummonUnit)
-end
-
-local function TryUpgrade()
-    local units = GetMyUnits()
-    if #units == 0 then return end
-
-    if CONFIG.UpgradePriority ~= "First" then
-        table.sort(units, function(a, b)
-            local ca = a:GetAttribute("Cost") or a:GetAttribute("Value") or 0
-            local cb = b:GetAttribute("Cost") or b:GetAttribute("Value") or 0
-            if CONFIG.UpgradePriority == "MostExpensive" then
-                return ca > cb
-            else
-                return ca < cb
-            end
+local function UpgradeOne(tower)
+    local tries = 0
+    while tries < CONFIG.UpgradeMaxTries do
+        local ok, ret = pcall(function()
+            return UpgradeTower:InvokeServer(tower)
         end)
-    end
-
-    Fire(CONFIG.Remotes.UpgradeUnit, units[1])
-end
-
-local function TryStartWave()
-    Fire(CONFIG.Remotes.StartWave)
-end
-
--- ============================================================
--- ANTI-AFK
--- ============================================================
-local function StartAntiAFK()
-    task.spawn(function()
-        while true do
-            task.wait(CONFIG.AntiAFKDelay)
-            pcall(function()
-                VirtualUser:CaptureController()
-                VirtualUser:Button1Down(Vector2.new(0, 0))
-                VirtualUser:Button1Up(Vector2.new(0, 0))
-            end)
-        end
-    end)
-end
-
--- ============================================================
--- FARM LOOP
--- ============================================================
-local function FarmLoop()
-    while FarmRunning do
-        TrySummon()
-        task.wait(CONFIG.SummonDelay)
-        if not FarmRunning then break end
-
-        TryUpgrade()
+        if not ok then return false, tostring(ret) end
+        if ret == false then return false, "server rejected" end
+        tries = tries + 1
         task.wait(CONFIG.UpgradeDelay)
-        if not FarmRunning then break end
-
-        TryStartWave()
-        task.wait(CONFIG.WaveDelay)
     end
+    return true
 end
 
-local function StartFarm()
-    if FarmRunning then return end
-    FarmRunning = true
-    FarmThread = task.spawn(FarmLoop)
-end
-
-local function StopFarm()
-    FarmRunning = false
-    if FarmThread then
-        task.cancel(FarmThread)
-        FarmThread = nil
+local function UpgradeAll()
+    local names = { "Jerry", "President", "Buff Turkey", "Space Cruiser" }
+    for _, suffix in ipairs(names) do
+        for _, t in ipairs(FindTowersBySuffix(suffix)) do
+            local ok, reason = UpgradeOne(t)
+            if not ok then
+                print(("[AFK] %s стоп: %s"):format(t.Name, reason))
+            else
+                print(("[AFK] %s прокачан"):format(t.Name))
+            end
+        end
     end
 end
 
 -- ============================================================
--- GUI
+-- AUTO-CLICK START WAVE
 -- ============================================================
-local function BuildGui()
-    local old = PlayerGui:FindFirstChild("PTD_AFK_Menu")
-    if old then old:Destroy() end
-
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "PTD_AFK_Menu"
-    gui.ResetOnSpawn = false
-    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    gui.Parent = PlayerGui
-
-    local frame = Instance.new("Frame")
-    frame.Name = "Main"
-    frame.Size = UDim2.new(0, 260, 0, 120)
-    frame.Position = UDim2.new(0, 20, 0, 20)
-    frame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
-    frame.BorderSizePixel = 0
-    frame.Active = true
-    frame.Draggable = true
-    frame.Parent = gui
-
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 8)
-    corner.Parent = frame
-
-    local stroke = Instance.new("UIStroke")
-    stroke.Color = Color3.fromRGB(0, 200, 100)
-    stroke.Thickness = 1
-    stroke.Transparency = 0.4
-    stroke.Parent = frame
-
-    local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, -16, 0, 28)
-    title.Position = UDim2.new(0, 8, 0, 6)
-    title.BackgroundTransparency = 1
-    title.Text = "PTD AFK Farm"
-    title.TextColor3 = Color3.fromRGB(0, 220, 110)
-    title.Font = Enum.Font.GothamBold
-    title.TextSize = 16
-    title.TextXAlignment = Enum.TextXAlignment.Left
-    title.Parent = frame
-
-    local toggleBtn = Instance.new("TextButton")
-    toggleBtn.Name = "ToggleFarm"
-    toggleBtn.Size = UDim2.new(1, -32, 0, 42)
-    toggleBtn.Position = UDim2.new(0, 16, 0, 48)
-    toggleBtn.BackgroundColor3 = Color3.fromRGB(0, 140, 70)
-    toggleBtn.BorderSizePixel = 0
-    toggleBtn.Text = "▶  ЗАПУСТИТЬ ФАРМ"
-    toggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    toggleBtn.Font = Enum.Font.GothamBold
-    toggleBtn.TextSize = 15
-    toggleBtn.AutoButtonColor = false
-    toggleBtn.Parent = frame
-
-    local btnCorner = Instance.new("UICorner")
-    btnCorner.CornerRadius = UDim.new(0, 6)
-    btnCorner.Parent = toggleBtn
-
-    local status = Instance.new("TextLabel")
-    status.Name = "Status"
-    status.Size = UDim2.new(1, -32, 0, 18)
-    status.Position = UDim2.new(0, 16, 0, 96)
-    status.BackgroundTransparency = 1
-    status.Text = "●  ОСТАНОВЛЕН"
-    status.TextColor3 = Color3.fromRGB(180, 60, 60)
-    status.Font = Enum.Font.Gotham
-    status.TextSize = 12
-    status.TextXAlignment = Enum.TextXAlignment.Left
-    status.Parent = frame
-
-    local function Refresh()
-        if FarmRunning then
-            toggleBtn.Text = "■  ОСТАНОВИТЬ ФАРМ"
-            toggleBtn.BackgroundColor3 = Color3.fromRGB(160, 50, 50)
-            status.Text = "●  РАБОТАЕТ"
-            status.TextColor3 = Color3.fromRGB(0, 220, 110)
-        else
-            toggleBtn.Text = "▶  ЗАПУСТИТЬ ФАРМ"
-            toggleBtn.BackgroundColor3 = Color3.fromRGB(0, 140, 70)
-            status.Text = "●  ОСТАНОВЛЕН"
-            status.TextColor3 = Color3.fromRGB(180, 60, 60)
+local function FindStartButton()
+    for _, gui in ipairs(PlayerGui:GetChildren()) do
+        if gui:IsA("ScreenGui") then
+            for _, obj in ipairs(gui:GetDescendants()) do
+                if obj:IsA("TextButton") then
+                    local txt = obj.Text:lower()
+                    for _, key in ipairs(CONFIG.StartTexts) do
+                        if txt:find(key) then return obj end
+                    end
+                elseif obj:IsA("ImageButton") then
+                    local nm = obj.Name:lower()
+                    for _, key in ipairs(CONFIG.StartTexts) do
+                        if nm:find(key) then return obj end
+                    end
+                end
+            end
         end
     end
+    return nil
+end
 
-    toggleBtn.MouseButton1Click:Connect(function()
-        if FarmRunning then
-            StopFarm()
+local function ClickButton(btn)
+    local ok, err = pcall(function()
+        if btn.Activate then
+            btn:Activate()
         else
-            StartFarm()
+            local pos = btn.AbsolutePosition + btn.AbsoluteSize / 2
+            VirtualUser:CaptureController()
+            VirtualUser:Button1Down(pos)
+            VirtualUser:Button1Up(pos)
         end
-        Refresh()
     end)
+    if not ok then warn("[AFK] ClickButton: " .. tostring(err)) end
+end
 
-    Refresh()
-    return gui
+local AutoClickRunning = true
+
+local function StartAutoClick()
+    task.spawn(function()
+        while AutoClickRunning do
+            local btn = FindStartButton()
+            if btn and btn.Visible then
+                ClickButton(btn)
+                print("[AFK] Клик по кнопке старта: " .. btn.Name)
+            end
+            task.wait(CONFIG.ClickInterval)
+        end
+    end)
 end
 
 -- ============================================================
 -- BOOT
 -- ============================================================
-StartAntiAFK()
-BuildGui()
-print("[AFK] PTD Farm загружен. Кнопка в меню. Если warn про Remote — правь CONFIG.Remotes.")
+VoteDifficulty(CONFIG.Difficulty)
+task.wait(1)
+PlaceAll()
+task.wait(1)
+UpgradeAll()
+StartAutoClick()
+print("[AFK] Полный цикл запущен. Перезапусти скрипт в новой катке после победы.")
