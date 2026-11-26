@@ -1,5 +1,6 @@
+
 -- language: Lua
--- target: Roblox client (Portal Tower Defense) — compact AFK farm
+-- target: Roblox client (Portal Tower Defense) — compact AFK farm v2
 
 local P  = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
@@ -12,6 +13,7 @@ local DIFF    = "Nightmare"
 local REMOTES = { "PlaceTower", "UpgradeTower", "DifficultyVote" }
 local COST    = { Jerry=250, ["Buff Turkey"]=800, President=1600, ["Space Cruiser"]=2200 }
 local UPG     = { Jerry={450,1100,2400,4800} }
+local TARGET_LV = 4
 local ST_TX   = { "start","начать","wave","волна" }
 local EX_TX   = { "again","replay","level","lvl","уровень","exit","выход","leave","покинуть","заново" }
 
@@ -31,8 +33,7 @@ local st = {phase="idle", detail="", tEnd=0, tName="", err=""}
 local function el() return os.clock() - matchStart end
 
 local function findCash()
-  local ls = LP:FindFirstChild("leaderstats")
-  if not ls then return nil end
+  local ls = LP:FindFirstChild("leaderstats"); if not ls then return nil end
   for _, n in ipairs({"cash","Cash","money","Money","coins","Coins"}) do
     local s = ls:FindFirstChild(n)
     if s and (s:IsA("IntValue") or s:IsA("NumberValue")) then return s end
@@ -43,8 +44,7 @@ local function cash()
   return cashStat and cashStat.Value or nil
 end
 local function remote(name)
-  local f = RS:FindFirstChild("Remotes")
-  if not f then return nil end
+  local f = RS:FindFirstChild("Remotes"); if not f then return nil end
   local r = f:FindFirstChild(name)
   if r and (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then return r end
 end
@@ -57,7 +57,7 @@ local function buildGui()
   f.BackgroundColor3=Color3.fromRGB(14,14,18); f.BorderSizePixel=0; f.Active=true; f.Draggable=true; f.Parent=gui
   Instance.new("UICorner",f).CornerRadius=UDim.new(0,10)
   local tl = Instance.new("TextLabel"); tl.Size=UDim2.new(1,-16,0,22); tl.Position=UDim2.new(0,8,0,4)
-  tl.BackgroundTransparency=1; tl.Text="PTD AFK"; tl.TextColor3=Color3.fromRGB(0,220,110)
+  tl.BackgroundTransparency=1; tl.Text="PTD AFK v2"; tl.TextColor3=Color3.fromRGB(0,220,110)
   tl.Font=Enum.Font.GothamBold; tl.TextSize=13; tl.TextXAlignment=Enum.TextXAlignment.Left; tl.Parent=f
   btn = Instance.new("TextButton"); btn.Size=UDim2.new(1,-32,0,30); btn.Position=UDim2.new(0,16,0,30)
   btn.BorderSizePixel=0; btn.Text="START"; btn.TextColor3=Color3.new(1,1,1); btn.Font=Enum.Font.GothamBold
@@ -150,43 +150,77 @@ local function baseName(n)
   return n
 end
 
-local function upgOne(t)
-  local r = remote("UpgradeTower"); if not r then return 0 end
-  local lv, fails, base = 0, 0, baseName(t.Name)
-  local costs = UPG[base]
-  while lv < 60 and fails < 10 and running do
-    if not t.Parent then break end
-    local need = costs and costs[lv]
-    if need then
-      local c = cash()
-      if c and c < need then
-        st.detail = ("%s L%d wait %d"):format(t.Name, lv+2, need)
-        local t0, ok = os.clock(), false
-        while running and os.clock()-t0 < 60 do
-          if cash() and cash() >= need then ok = true; break end
-          task.wait(0.5)
-        end
-        if not ok then print("[AFK] "..t.Name.." gave up "..need); return lv end
-      end
-    end
-    local ok, ret = pcall(r.InvokeServer, r, t)
-    if not ok then break end
-    if ret == false or ret == nil then fails = fails + 1; task.wait(1.5)
-    else lv = lv + 1; fails = 0; print(("[AFK] %s L%d"):format(t.Name, lv+1)) end
-    task.wait(0.15)
-  end
-  return lv
-end
-
-local function upgAll()
-  local total = 0
+-- ============================================================
+-- UPGRADE: общий пул, качаем что доступно, до TARGET_LV
+-- ============================================================
+local function gatherTargets()
+  local list = {}
   for _, s in ipairs({"Jerry","Buff Turkey","President","Space Cruiser"}) do
     for _, t in ipairs(towers(s)) do
-      if not running then return total end
-      total = total + upgOne(t)
+      list[#list+1] = {tower=t, base=s, lv=1}
     end
   end
-  return total
+  return list
+end
+
+local function upgradeLoop()
+  local r = remote("UpgradeTower"); if not r then return end
+  local targets = gatherTargets()
+  local total = 0
+
+  while running do
+    local didSomething = false
+
+    -- ищем самый дешёвый доступный апгрейд
+    local best, bestNeed = nil, math.huge
+    for _, ent in ipairs(targets) do
+      if ent.lv < TARGET_LV and ent.tower.Parent then
+        local costs = UPG[ent.base]
+        local need = costs and costs[ent.lv] or 0
+        local c = cash() or 0
+        if need == 0 or c >= need then
+          if need < bestNeed then best = ent; bestNeed = need end
+        end
+      end
+    end
+
+    if not best then
+      -- ничего не доступно: ждём деньги или выходим, если всё на TARGET_LV
+      local anyLeft = false
+      for _, ent in ipairs(targets) do
+        if ent.lv < TARGET_LV and ent.tower.Parent then anyLeft = true; break end
+      end
+      if not anyLeft then break end
+      local c = cash() or 0
+      local minNeed = math.huge
+      for _, ent in ipairs(targets) do
+        if ent.lv < TARGET_LV and ent.tower.Parent then
+          local costs = UPG[ent.base]
+          local need = costs and costs[ent.lv] or 0
+          if need < minNeed then minNeed = need end
+        end
+      end
+      st.detail = ("wait for %d (have %d)"):format(minNeed, c)
+      task.wait(1)
+    else
+      st.detail = ("upgrade %s to L%d"):format(best.tower.Name, best.lv+1)
+      local ok, ret = pcall(r.InvokeServer, r, best.tower)
+      if ok and ret ~= false and ret ~= nil then
+        best.lv = best.lv + 1
+        total = total + 1
+        didSomething = true
+        print(("[AFK] %s -> L%d"):format(best.tower.Name, best.lv))
+      else
+        -- отказ: возможно максимум или денег мало, пропускаем на секунду
+        task.wait(1.5)
+      end
+      task.wait(0.12)
+    end
+
+    if not running then break end
+  end
+
+  print(("[AFK] upgrades total +%d"):format(total))
 end
 
 local function findBtn()
@@ -241,7 +275,7 @@ local function loop()
   if not running then return end
 
   st.phase = "upgrade"
-  local ups = upgAll(); print("[AFK] upgraded +"..ups)
+  upgradeLoop()
   if not running then return end
 
   st.phase = "click"
