@@ -1,6 +1,6 @@
 -- language: Lua
 -- target: Roblox client (Portal Tower Defense)
--- AFK farm — leaderstats.money aware, waits for funds, GUI toggle
+-- AFK farm — timed placement schedule, then upgrade, GUI toggle
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -19,87 +19,91 @@ local TowersFolder   = workspace:WaitForChild("Towers")
 -- ============================================================
 local CONFIG = {
     Difficulty      = "Nightmare",
-    MoneyStatName   = "money",   -- имя статы в leaderstats
-    PlaceDelay      = 0.3,
+    MoneyStatNames  = { "cash", "Cash", "money", "Money" },
     UpgradeDelay    = 0.15,
     UpgradeMaxTries = 60,
     ClickInterval   = 5,
     StartTexts      = { "start", "начать", "wave", "волна", "next", "далее", "play", "играть" },
-    MoneyWaitTimeout = 120,       -- максимум секунд ждать деньги
-}
-
-local PLACEMENTS = {
-    { name = "Jerry",        pos = Vector3.new(115.77935791015625, 7.954591751098633, -46.52529525756836), rot = 0 },
-    { name = "Jerry",        pos = Vector3.new(113.5140380859375,  7.933708190917969, -49.838958740234375), rot = 0 },
-    { name = "Buff Turkey",  pos = Vector3.new(105.41456604003906, 7.935329437255859, -50.34072494506836), rot = 0 },
-    { name = "President",    pos = Vector3.new(109.55278778076172, 7.922641754150391, -46.534759521484375), rot = 0 },
-    { name = "President",    pos = Vector3.new(109.61953735351562, 7.935300827026367, -50.340065002441406), rot = 0 },
-    { name = "Space Cruiser", pos = Vector3.new(131.7823028564453, 8.261308670043945, -51.3819694519043), rot = 0 },
+    PlaceRetryEvery = 1,      -- если отказ — пробовать каждую секунду
+    PlaceMaxWait    = 60,     -- максимум секунд ждать на одну точку
 }
 
 -- ============================================================
--- LEADERSTATS MONEY
+-- РАСПИСАНИЕ: { время_от_старта_сек, имя, позиция }
 -- ============================================================
-local function GetMoney()
+local SCHEDULE = {
+    { t = 0,   name = "Jerry",        pos = Vector3.new(115.77935791015625, 7.954591751098633, -46.52529525756836) },
+    { t = 0,   name = "Jerry",        pos = Vector3.new(113.5140380859375,  7.933708190917969, -49.838958740234375) },
+    { t = 15,  name = "Buff Turkey",  pos = Vector3.new(105.41456604003906, 7.935329437255859, -50.34072494506836) },
+    { t = 45,  name = "President",    pos = Vector3.new(109.55278778076172, 7.922641754150391, -46.534759521484375) },
+    { t = 75,  name = "President",    pos = Vector3.new(109.61953735351562, 7.935300827026367, -50.340065002441406) },
+    { t = 105, name = "Space Cruiser", pos = Vector3.new(131.7823028564453, 8.261308670043945, -51.3819694519043) },
+}
+
+-- ============================================================
+-- CASH
+-- ============================================================
+local MoneyStat = nil
+local function FindMoneyStat()
     local ls = LocalPlayer:FindFirstChild("leaderstats")
     if not ls then return nil end
-    local stat = ls:FindFirstChild(CONFIG.MoneyStatName)
-    if not stat then return nil end
-    return stat.Value
+    for _, name in ipairs(CONFIG.MoneyStatNames) do
+        local s = ls:FindFirstChild(name)
+        if s and (s:IsA("IntValue") or s:IsA("NumberValue")) then return s end
+    end
+    return nil
 end
 
--- Ждём, пока денег станет >= target (или таймаут)
-local function WaitForMoney(target, timeoutSec)
-    timeoutSec = timeoutSec or CONFIG.MoneyWaitTimeout
-    local start = os.clock()
-    while os.clock() - start < timeoutSec do
-        local m = GetMoney()
-        if m and m >= target then return true, m end
-        task.wait(1)
-    end
-    local m = GetMoney()
-    return false, m
+local function GetMoney()
+    if not MoneyStat or not MoneyStat.Parent then MoneyStat = FindMoneyStat() end
+    return MoneyStat and MoneyStat.Value or nil
 end
 
 -- ============================================================
 -- VOTE
 -- ============================================================
 local function VoteDifficulty(diff)
-    pcall(function()
-        DifficultyVote:FireServer(diff)
-    end)
+    pcall(function() DifficultyVote:FireServer(diff) end)
 end
 
 -- ============================================================
--- PLACE — ставим по одному, ждём деньги если отказ
+-- PLACE ПО РАСПИСАНИЮ
 -- ============================================================
-local function PlaceAll()
-    local placed = 0
-    for i, e in ipairs(PLACEMENTS) do
-        local success = false
-        for attempt = 1, 30 do
-            local ok, ret = pcall(function()
-                return PlaceTower:InvokeServer(e.name, e.pos, e.rot or 0)
-            end)
-            if ok and ret ~= false and ret ~= nil then
-                success = true
-                print(("[AFK] %s поставлен (%d/%d)"):format(e.name, i, #PLACEMENTS))
-                break
-            end
-            -- отказ: ждём деньги и пробуем снова
-            local before = GetMoney()
-            print(("[AFK] %s отказ. Баланс: %s. Ждём..."):format(e.name, tostring(before)))
-            WaitForMoney((before or 0) + 1, 30)   -- ждём, пока баланс хоть немного вырастет
+local function PlaceTimed(entry)
+    local start = os.clock()
+    local deadline = entry.t + CONFIG.PlaceMaxWait
+    local attempt = 0
+    while os.clock() < deadline do
+        -- ждём, пока не наступит время
+        local now = os.clock() - start
+        if now < entry.t then
+            task.wait(entry.t - now)
         end
-        if success then placed = placed + 1
-        else warn(("[AFK] %s не поставлен после 30 попыток"):format(e.name)) end
-        task.wait(CONFIG.PlaceDelay)
+        attempt = attempt + 1
+        local ok, ret = pcall(function()
+            return PlaceTower:InvokeServer(entry.name, entry.pos, 0)
+        end)
+        if ok and ret ~= false and ret ~= nil then
+            print(("[AFK] t+%ds %s поставлен (попытка %d, cash=%s)"):format(entry.t, entry.name, attempt, tostring(GetMoney())))
+            return true
+        end
+        print(("[AFK] t+%ds %s отказ (cash=%s), пробую снова..."):format(entry.t, entry.name, tostring(GetMoney())))
+        task.wait(CONFIG.PlaceRetryEvery)
     end
-    print(("[AFK] Итого: %d/%d"):format(placed, #PLACEMENTS))
+    warn(("[AFK] %s не поставлен за %d сек"):format(entry.name, CONFIG.PlaceMaxWait))
+    return false
+end
+
+local function PlaceAllTimed()
+    local placed = 0
+    for _, entry in ipairs(SCHEDULE) do
+        if PlaceTimed(entry) then placed = placed + 1 end
+    end
+    print(("[AFK] Расставлено: %d/%d"):format(placed, #SCHEDULE))
 end
 
 -- ============================================================
--- UPGRADE — качаем, ждём деньги при отказе
+-- UPGRADE (после расстановки)
 -- ============================================================
 local function FindTowersBySuffix(suffix)
     local out = {}
@@ -112,7 +116,7 @@ end
 local function UpgradeOne(tower)
     local levels = 0
     local fails = 0
-    while levels < CONFIG.UpgradeMaxTries and fails < 10 do
+    while levels < CONFIG.UpgradeMaxTries and fails < 15 do
         local ok, ret = pcall(function()
             return UpgradeTower:InvokeServer(tower)
         end)
@@ -122,13 +126,11 @@ local function UpgradeOne(tower)
         end
         if ret == false or ret == nil then
             fails = fails + 1
-            local before = GetMoney()
-            print(("[AFK] %s уровень %d отказ. Баланс: %s. Ждём..."):format(tower.Name, levels + 1, tostring(before)))
-            WaitForMoney((before or 0) + 1, 20)
+            task.wait(2)   -- ждём, пока cash капнет
         else
             levels = levels + 1
             fails = 0
-            print(("[AFK] %s -> уровень %d"):format(tower.Name, levels + 1))
+            print(("[AFK] %s -> ур.%d (cash=%s)"):format(tower.Name, levels + 1, tostring(GetMoney())))
         end
         task.wait(CONFIG.UpgradeDelay)
     end
@@ -139,13 +141,13 @@ local function UpgradeAll()
     for _, suffix in ipairs({ "Jerry", "Buff Turkey", "President", "Space Cruiser" }) do
         for _, t in ipairs(FindTowersBySuffix(suffix)) do
             local lv = UpgradeOne(t)
-            print(("[AFK] %s итог: +%d уровней"):format(t.Name, lv))
+            print(("[AFK] %s итог: +%d"):format(t.Name, lv))
         end
     end
 end
 
 -- ============================================================
--- AUTO-CLICK START
+-- AUTO-CLICK
 -- ============================================================
 local function FindStartButton()
     for _, gui in ipairs(PlayerGui:GetChildren()) do
@@ -186,8 +188,7 @@ local function FarmLoop()
         task.wait(1)
         if not FarmRunning then break end
 
-        PlaceAll()
-        task.wait(1)
+        PlaceAllTimed()
         if not FarmRunning then break end
 
         UpgradeAll()
@@ -204,10 +205,9 @@ end
 local function StartFarm()
     if FarmRunning then return end
     FarmRunning = true
-    -- проверка money при старте
-    local m = GetMoney()
-    if m then print(("[AFK] Баланс на старте: %d"):format(m))
-    else warn("[AFK] leaderstats.money не найден — проверь имя статы") end
+    MoneyStat = FindMoneyStat()
+    if MoneyStat then print(("[AFK] cash найден: %d"):format(MoneyStat.Value))
+    else warn("[AFK] cash не найден") end
     FarmThread = task.spawn(FarmLoop)
     print("[AFK] Фарм запущен")
 end
@@ -224,74 +224,52 @@ end
 local function BuildGui()
     local old = PlayerGui:FindFirstChild("PTD_AFK_Menu")
     if old then old:Destroy() end
-
     local gui = Instance.new("ScreenGui")
-    gui.Name = "PTD_AFK_Menu"
-    gui.ResetOnSpawn = false
-    gui.Parent = PlayerGui
-
+    gui.Name = "PTD_AFK_Menu"; gui.ResetOnSpawn = false; gui.Parent = PlayerGui
     local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 240, 0, 130)
-    frame.Position = UDim2.new(0, 20, 0, 20)
-    frame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
-    frame.BorderSizePixel = 0
-    frame.Active = true
-    frame.Draggable = true
-    frame.Parent = gui
+    frame.Size = UDim2.new(0, 240, 0, 130); frame.Position = UDim2.new(0, 20, 0, 20)
+    frame.BackgroundColor3 = Color3.fromRGB(18, 18, 22); frame.BorderSizePixel = 0
+    frame.Active = true; frame.Draggable = true; frame.Parent = gui
     Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
-
     local title = Instance.new("TextLabel", frame)
-    title.Size = UDim2.new(1, -16, 0, 26)
-    title.Position = UDim2.new(0, 8, 0, 6)
-    title.BackgroundTransparency = 1
-    title.Text = "PTD AFK"
-    title.TextColor3 = Color3.fromRGB(0, 220, 110)
-    title.Font = Enum.Font.GothamBold
-    title.TextSize = 15
-    title.TextXAlignment = Enum.TextXAlignment.Left
-
+    title.Size = UDim2.new(1, -16, 0, 26); title.Position = UDim2.new(0, 8, 0, 6)
+    title.BackgroundTransparency = 1; title.Text = "PTD AFK"
+    title.TextColor3 = Color3.fromRGB(0, 220, 110); title.Font = Enum.Font.GothamBold
+    title.TextSize = 15; title.TextXAlignment = Enum.TextXAlignment.Left
     local btn = Instance.new("TextButton", frame)
-    btn.Size = UDim2.new(1, -32, 0, 40)
-    btn.Position = UDim2.new(0, 16, 0, 40)
-    btn.BorderSizePixel = 0
-    btn.Text = "▶  ВКЛ"
-    btn.TextColor3 = Color3.new(1,1,1)
-    btn.Font = Enum.Font.GothamBold
-    btn.TextSize = 14
-    btn.AutoButtonColor = false
+    btn.Size = UDim2.new(1, -32, 0, 40); btn.Position = UDim2.new(0, 16, 0, 40)
+    btn.BorderSizePixel = 0; btn.Text = "▶  ВКЛ"; btn.TextColor3 = Color3.new(1,1,1)
+    btn.Font = Enum.Font.GothamBold; btn.TextSize = 14; btn.AutoButtonColor = false
     Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
-
     local status = Instance.new("TextLabel", frame)
-    status.Size = UDim2.new(1, -32, 0, 20)
-    status.Position = UDim2.new(0, 16, 0, 88)
-    status.BackgroundTransparency = 1
-    status.Text = "ВЫКЛ"
-    status.TextColor3 = Color3.fromRGB(200, 60, 60)
-    status.Font = Enum.Font.Gotham
-    status.TextSize = 12
-    status.TextXAlignment = Enum.TextXAlignment.Left
-
+    status.Size = UDim2.new(1, -32, 0, 20); status.Position = UDim2.new(0, 16, 0, 88)
+    status.BackgroundTransparency = 1; status.Text = "ВЫКЛ"
+    status.TextColor3 = Color3.fromRGB(200, 60, 60); status.Font = Enum.Font.Gotham
+    status.TextSize = 12; status.TextXAlignment = Enum.TextXAlignment.Left
     local function Refresh()
         if FarmRunning then
-            btn.Text = "■  ВЫКЛ"
-            btn.BackgroundColor3 = Color3.fromRGB(160, 50, 50)
-            status.Text = "РАБОТАЕТ"
-            status.TextColor3 = Color3.fromRGB(0, 220, 110)
+            btn.Text = "■  ВЫКЛ"; btn.BackgroundColor3 = Color3.fromRGB(160, 50, 50)
+            status.Text = "РАБОТАЕТ"; status.TextColor3 = Color3.fromRGB(0, 220, 110)
         else
-            btn.Text = "▶  ВКЛ"
-            btn.BackgroundColor3 = Color3.fromRGB(0, 140, 70)
-            status.Text = "ВЫКЛ"
-            status.TextColor3 = Color3.fromRGB(200, 60, 60)
+            btn.Text = "▶  ВКЛ"; btn.BackgroundColor3 = Color3.fromRGB(0, 140, 70)
+            status.Text = "ВЫКЛ"; status.TextColor3 = Color3.fromRGB(200, 60, 60)
         end
     end
-
     btn.MouseButton1Click:Connect(function()
         if FarmRunning then StopFarm() else StartFarm() end
         Refresh()
     end)
-
     Refresh()
 end
 
+-- ============================================================
+-- BOOT — автостарт
+-- ============================================================
 BuildGui()
-print("[AFK] Меню готово. ВКЛ / ВЫКЛ. Money stat: " .. CONFIG.MoneyStatName)
+local ok = pcall(function() workspace:WaitForChild("Towers", 30) end)
+if ok then
+    task.wait(2)
+    StartFarm()
+else
+    warn("[AFK] Towers не появились — запусти скрипт внутри катки")
+end
