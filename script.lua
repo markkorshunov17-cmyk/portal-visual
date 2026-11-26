@@ -1,6 +1,6 @@
 -- language: Lua
 -- target: Roblox client (Portal Tower Defense)
--- AFK farm v11 — narrower start-button match, no Next Level trap, clean thread exit
+-- AFK farm v13 — full build: costs, upgrade prices, cash-aware, GUI
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -8,24 +8,61 @@ local VirtualUser       = game:GetService("VirtualUser")
 local LocalPlayer       = Players.LocalPlayer
 local PlayerGui         = LocalPlayer:WaitForChild("PlayerGui")
 
+-- ============================================================
+-- CONFIG
+-- ============================================================
 local CONFIG = {
     Difficulty      = "Nightmare",
     MoneyNames      = { "cash", "Cash", "money", "Money", "coins", "Coins" },
-    PlaceRetryEvery = 1,
+    PlaceRetryEvery = 0.5,
     UpgradeDelay    = 0.12,
     UpgradeFailsMax = 15,
     ClickInterval   = 4,
     StartTexts      = { "start", "начать", "wave", "волна" },
-    ExcludeTexts    = { "again", "replay", "заново", "ещё раз", "exit", "выход", "leave", "покинуть", "level", "lvl", "уровень" },
-    BootWait        = 120,
-    RemotesWait     = 30,
-    RemoteNames     = { "PlaceTower", "UpgradeTower", "DifficultyVote" },
-    MatchStartDelay = 3,
+    ExcludeTexts    = { "again", "replay", "заново", "ещё раз", "exit", "выход",
+                        "leave", "покинуть", "level", "lvl", "уровень" },
+    BootWait         = 120,
+    RemotesWait      = 30,
+    RemoteNames      = { "PlaceTower", "UpgradeTower", "DifficultyVote" },
+    MatchStartDelay  = 3,
     TowerWaitTimeout = 10,
     TowerWaitPoll    = 0.5,
     ClickMissLimit   = 15,
+    CashPoll         = 0.5,
+    UpgradeCashWait  = 60,   -- максимум секунд ждать деньги на апгрейд
 }
 
+-- ============================================================
+-- ЦЕНЫ ПОСТРОЙКИ (точные, от тебя)
+-- ============================================================
+local COST = {
+    ["Jerry"]         = 250,
+    ["Buff Turkey"]   = 800,
+    ["President"]     = 1600,
+    ["Space Cruiser"] = 2200,
+}
+
+-- ============================================================
+-- ЦЕНЫ АПГРЕЙДА (стоимость каждого шага; nil = неизвестно)
+-- Jerry: 1→2 = 450, 2→3 = 1100, 3→4 = 2400, 4→5 = 4800
+-- ============================================================
+local UPGRADE_COST = {
+    ["Jerry"] = { 450, 1100, 2400, 4800 },
+    -- ["Buff Turkey"]   = { ... },   -- скинь через SimpleSpy — добавлю
+    -- ["President"]     = { ... },
+    -- ["Space Cruiser"] = { ... },
+}
+
+-- Возвращает стоимость следующего уровня или nil
+local function NextUpgradeCost(towerName, currentLevel)
+    local list = UPGRADE_COST[towerName]
+    if not list then return nil end
+    return list[currentLevel]  -- currentLevel: 1 = только поставлен
+end
+
+-- ============================================================
+-- РАСПИСАНИЕ
+-- ============================================================
 local SCHEDULE = {
     { t = 0,   name = "Jerry",        pos = Vector3.new(115.77935791015625, 7.954591751098633, -46.52529525756836) },
     { t = 0,   name = "Jerry",        pos = Vector3.new(113.5140380859375,  7.933708190917969, -49.838958740234375) },
@@ -35,6 +72,9 @@ local SCHEDULE = {
     { t = 105, name = "Space Cruiser", pos = Vector3.new(131.7823028564453, 8.261308670043945, -51.3819694519043) },
 }
 
+-- ============================================================
+-- STATE
+-- ============================================================
 local State = {
     running = false, phase = "idle", detail = "",
     timerEnd = nil, timerName = "", error = "",
@@ -61,6 +101,9 @@ local function ValidateSchedule()
         end
         if type(e.t) ~= "number" or e.t < 0 then
             return false, ("SCHEDULE[%d].t не число"):format(i)
+        end
+        if not COST[e.name] then
+            return false, ("SCHEDULE[%d]: нет цены для %s"):format(i, e.name)
         end
     end
     return true, nil
@@ -121,6 +164,17 @@ local function Cash()
     return CashStat and CashStat.Value or nil
 end
 
+-- Ждём cash >= need, обновляя detail. true = дождались.
+local function WaitForCash(need, label)
+    while State.running do
+        local c = Cash()
+        if c and c >= need then return true end
+        SetPhase("place", ("жду %d (есть %s) для %s"):format(need, tostring(c or "?"), label or ""))
+        task.wait(CONFIG.CashPoll)
+    end
+    return false
+end
+
 -- ============================================================
 -- VOTE
 -- ============================================================
@@ -139,15 +193,25 @@ local function PlaceOne(entry)
     if waitLeft > 0 then task.wait(waitLeft) end
     if not State.running then return false end
 
+    local cost = COST[entry.name] or 0
+
+    -- ждём нужную сумму перед вызовом
+    if not WaitForCash(cost, entry.name) then return false end
+    if not State.running then return false end
+
     local attempt = 0
     while State.running do
         local r = Remote("PlaceTower")
         if not r then task.wait(2)
         else
+            local c = Cash()
+            if c and c < cost then
+                if not WaitForCash(cost, entry.name) then return false end
+            end
             attempt = attempt + 1
             local ok, ret = pcall(function() return r:InvokeServer(entry.name, entry.pos, 0) end)
-            print(("[DEBUG] PlaceTower(%s) #%d ok=%s ret=%s cash=%s"):format(
-                entry.name, attempt, tostring(ok), tostring(ret), tostring(Cash())))
+            print(("[DEBUG] PlaceTower(%s) #%d cost=%d ok=%s ret=%s cash=%s"):format(
+                entry.name, attempt, cost, tostring(ok), tostring(ret), tostring(Cash())))
             if ok and ret ~= false then return true end
             task.wait(CONFIG.PlaceRetryEvery)
         end
@@ -239,13 +303,50 @@ local function WaitForAnyTower()
     return false
 end
 
+-- Определяем базовое имя юнита из имени объекта
+local function BaseUnitName(towerName)
+    for _, suffix in ipairs({ "Space Cruiser", "Buff Turkey", "President", "Jerry" }) do
+        if towerName:sub(-#suffix) == suffix then return suffix end
+    end
+    return towerName
+end
+
 local function UpgradeOne(tower)
     local r = Remote("UpgradeTower")
     if not r then return 0 end
     local levels, fails = 0, 0
+    local baseName = BaseUnitName(tower.Name)
+
     while levels < 60 and fails < CONFIG.UpgradeFailsMax and State.running do
         if not tower or not tower.Parent then break end
-        SetPhase("upgrade", ("%s ур.%d"):format(tower.Name, levels + 1))
+
+        local currentLevel = levels + 1
+        local need = NextUpgradeCost(baseName, currentLevel)
+
+        if need then
+            local c = Cash()
+            if c and c < need then
+                SetPhase("upgrade", ("%s ур.%d: жду %d (есть %s)"):format(
+                    tower.Name, currentLevel + 1, need, tostring(c)))
+                local start = os.clock()
+                local okWait = false
+                while State.running do
+                    local c2 = Cash()
+                    if c2 and c2 >= need then okWait = true; break end
+                    if os.clock() - start > CONFIG.UpgradeCashWait then break end
+                    task.wait(CONFIG.CashPoll)
+                end
+                if not okWait then
+                    print(("[AFK] %s: не дождался %d за %d сек"):format(
+                        tower.Name, need, CONFIG.UpgradeCashWait))
+                    return levels
+                end
+            end
+        else
+            SetPhase("upgrade", ("%s ур.%d (цена неизвестна, пробую)"):format(
+                tower.Name, currentLevel + 1))
+        end
+
         local ok, ret = pcall(function() return r:InvokeServer(tower) end)
         if not ok then break end
         if ret == false or ret == nil then
@@ -283,7 +384,7 @@ local function UpgradeAll()
 end
 
 -- ============================================================
--- AUTO-CLICK — не кэширует невидимую кнопку
+-- AUTO-CLICK
 -- ============================================================
 local CachedButton = nil
 
@@ -381,7 +482,7 @@ local function Loop()
         task.wait(CONFIG.ClickInterval)
     end
 
-    FarmThread = nil   -- чистое завершение
+    FarmThread = nil
 end
 
 local function Start()
@@ -420,7 +521,7 @@ local function BuildGui()
 
     local title = Instance.new("TextLabel", frame)
     title.Size = UDim2.new(1, -16, 0, 26); title.Position = UDim2.new(0, 10, 0, 6)
-    title.BackgroundTransparency = 1; title.Text = "PTD AFK FARM v11"
+    title.BackgroundTransparency = 1; title.Text = "PTD AFK FARM v13"
     title.TextColor3 = Color3.fromRGB(0, 220, 110); title.Font = Enum.Font.GothamBold
     title.TextSize = 14; title.TextXAlignment = Enum.TextXAlignment.Left
 
@@ -438,73 +539,4 @@ local function BuildGui()
 
     local detail = Instance.new("TextLabel", frame)
     detail.Size = UDim2.new(1, -32, 0, 18); detail.Position = UDim2.new(0, 16, 0, 112)
-    detail.BackgroundTransparency = 1; detail.Text = "ВЫКЛ"
-    detail.TextColor3 = Color3.fromRGB(180, 180, 180); detail.Font = Enum.Font.Gotham
-    detail.TextSize = 12; detail.TextXAlignment = Enum.TextXAlignment.Left
-
-    local cash = Instance.new("TextLabel", frame)
-    cash.Size = UDim2.new(1, -32, 0, 18); cash.Position = UDim2.new(0, 16, 0, 132)
-    cash.BackgroundTransparency = 1; cash.Text = "cash: --"
-    cash.TextColor3 = Color3.fromRGB(110, 190, 255); cash.Font = Enum.Font.Gotham
-    cash.TextSize = 12; cash.TextXAlignment = Enum.TextXAlignment.Left
-
-    local phase = Instance.new("TextLabel", frame)
-    phase.Size = UDim2.new(1, -32, 0, 16); phase.Position = UDim2.new(0, 16, 0, 152)
-    phase.BackgroundTransparency = 1; phase.Text = ""
-    phase.TextColor3 = Color3.fromRGB(120, 120, 120); phase.Font = Enum.Font.Gotham
-    phase.TextSize = 11; phase.TextXAlignment = Enum.TextXAlignment.Left
-
-    local err = Instance.new("TextLabel", frame)
-    err.Size = UDim2.new(1, -32, 0, 40); err.Position = UDim2.new(0, 16, 0, 172)
-    err.BackgroundTransparency = 1; err.Text = ""
-    err.TextColor3 = Color3.fromRGB(220, 80, 80); err.Font = Enum.Font.Gotham
-    err.TextSize = 11; err.TextXAlignment = Enum.TextXAlignment.Left; err.TextWrapped = true
-
-    local function RefreshButton()
-        if State.running then
-            btn.Text = "■  ОСТАНОВИТЬ"; btn.BackgroundColor3 = Color3.fromRGB(170, 45, 45)
-        else
-            btn.Text = "▶  ЗАПУСТИТЬ"; btn.BackgroundColor3 = Color3.fromRGB(0, 150, 75)
-        end
-    end
-
-    btn.MouseButton1Click:Connect(function()
-        if State.running then Stop() else Start() end
-        RefreshButton()
-    end)
-
-    task.spawn(function()
-        while gui.Parent do
-            if State.timerEnd then
-                local left = State.timerEnd - os.clock()
-                timer.Text = left > 0
-                    and ("%.1f с → %s"):format(left, State.timerName)
-                    or ("0.0 с → " .. State.timerName)
-            else timer.Text = "--" end
-            detail.Text = State.detail ~= "" and State.detail or "ВЫКЛ"
-            phase.Text = State.phase ~= "idle" and ("фаза: " .. State.phase) or ""
-            local c = Cash(); cash.Text = "cash: " .. tostring(c or "--")
-            err.Text = State.error
-            task.wait(0.15)
-        end
-    end)
-
-    RefreshButton()
-    return gui
-end
-
--- ============================================================
--- BOOT
--- ============================================================
-BuildGui()
-print("[AFK] v11 меню готово")
-
-task.spawn(function()
-    local folder = workspace:WaitForChild("Towers", CONFIG.BootWait)
-    if folder then
-        task.wait(2)
-        if not State.running then Start() end
-    else
-        warn("[AFK] Towers не появились за " .. CONFIG.BootWait .. " сек")
-    end
-end)
+    detail.Backgr
