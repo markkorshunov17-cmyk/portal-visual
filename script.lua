@@ -1,68 +1,92 @@
 
--- PORTAL HUB | Version 1.0
--- Local visual interface prototype
+-- PORTAL HUB v2.0
+-- Local visual prototype for Roblox Studio
+-- Place as a LocalScript in StarterPlayerScripts
 
 local Players = game:GetService("Players")
 local player = Players.LocalPlayer
 
+local old = player.PlayerGui:FindFirstChild("PortalHub")
+if old then old:Destroy() end
+
 local gui = Instance.new("ScreenGui")
 gui.Name = "PortalHub"
 gui.ResetOnSpawn = false
+gui.Parent = player.PlayerGui
 
-local main = Instance.new("Frame")
-main.Size = UDim2.fromOffset(340, 420)
-main.Position = UDim2.new(0.5, -170, 0.5, -210)
-main.BackgroundColor3 = Color3.fromRGB(18, 15, 29)
-main.BorderSizePixel = 0
-main.Parent = gui
-
-local corner = Instance.new("UICorner")
-corner.CornerRadius = UDim.new(0, 14)
-corner.Parent = main
-
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, 0, 0, 50)
-title.BackgroundColor3 = Color3.fromRGB(85, 45, 145)
-title.Text = "PORTAL HUB"
-title.TextColor3 = Color3.new(1, 1, 1)
-title.TextSize = 23
-title.Font = Enum.Font.GothamBold
-title.Parent = main
-
-local coins = 999999
-local inventory = {}
-
-local function makeLabel(text, y)
-    local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(1, -30, 0, 35)
-    label.Position = UDim2.fromOffset(15, y)
-    label.BackgroundTransparency = 1
-    label.Text = text
-    label.TextColor3 = Color3.new(1, 1, 1)
-    label.TextSize = 17
-    label.Font = Enum.Font.Gotham
-    label.TextXAlignment = Enum.TextXAlignment.Left
-    label.Parent = main
-    return label
+local function create(class, props, parent)
+    local obj = Instance.new(class)
+    for k, v in pairs(props) do
+        obj[k] = v
+    end
+    obj.Parent = parent
+    return obj
 end
 
-local coinLabel = makeLabel("Visual Coins: " .. coins, 65)
+local main = create("Frame", {
+    Size = UDim2.fromOffset(340, 440),
+    Position = UDim2.new(0.5, -170, 0.5, -220),
+    BackgroundColor3 = Color3.fromRGB(20, 16, 31),
+    BorderSizePixel = 0
+}, gui)
 
-local coinInput = Instance.new("TextBox")
-coinInput.Size = UDim2.new(1, -30, 0, 38)
-coinInput.Position = UDim2.fromOffset(15, 105)
-coinInput.PlaceholderText = "Enter coin amount"
-coinInput.Text = ""
-coinInput.TextSize = 16
-coinInput.Parent = main
+create("UICorner", {
+    CornerRadius = UDim.new(0, 14)
+}, main)
 
-local coinButton = Instance.new("TextButton")
-coinButton.Size = UDim2.new(1, -30, 0, 38)
-coinButton.Position = UDim2.fromOffset(15, 150)
-coinButton.Text = "SET VISUAL COINS"
-coinButton.BackgroundColor3 = Color3.fromRGB(105, 60, 175)
-coinButton.TextColor3 = Color3.new(1, 1, 1)
-coinButton.Parent = main
+local title = create("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 48),
+    BackgroundColor3 = Color3.fromRGB(100, 55, 170),
+    Text = "PORTAL HUB",
+    TextColor3 = Color3.new(1, 1, 1),
+    TextSize = 23,
+    Font = Enum.Font.GothamBold
+}, main)
+
+local coins = 0
+local inventory = {}
+local selected = nil
+
+-- Only provisional names; replace with verified unit names.
+local units = {
+    "Docs",
+    "Milos",
+    "News Milo",
+    "Rick",
+    "Evil Morty"
+}
+
+local coinInput = create("TextBox", {
+    Size = UDim2.new(1, -30, 0, 38),
+    Position = UDim2.fromOffset(15, 65),
+    BackgroundColor3 = Color3.fromRGB(42, 32, 58),
+    TextColor3 = Color3.new(1, 1, 1),
+    PlaceholderText = "Enter visual coin amount",
+    Text = "",
+    TextSize = 15,
+    Font = Enum.Font.Gotham
+}, main)
+
+local coinLabel = create("TextLabel", {
+    Size = UDim2.new(1, -30, 0, 30),
+    Position = UDim2.fromOffset(15, 105),
+    BackgroundTransparency = 1,
+    Text = "Visual Coins: 0",
+    TextColor3 = Color3.fromRGB(210, 180, 255),
+    TextSize = 17,
+    Font = Enum.Font.GothamBold,
+    TextXAlignment = Enum.TextXAlignment.Left
+}, main)
+
+local coinButton = create("TextButton", {
+    Size = UDim2.new(1, -30, 0, 35),
+    Position = UDim2.fromOffset(15, 140),
+    BackgroundColor3 = Color3.fromRGB(100, 55, 170),
+    Text = "SET VISUAL COINS",
+    TextColor3 = Color3.new(1, 1, 1),
+    TextSize = 14,
+    Font = Enum.Font.GothamBold
+}, main)
 
 coinButton.MouseButton1Click:Connect(function()
     local amount = tonumber(coinInput.Text)
@@ -72,57 +96,109 @@ coinButton.MouseButton1Click:Connect(function()
     end
 end)
 
-local units = {
-    "Rick",
-    "Evil Morty",
-    "Doofus Jerry",
-    "Milos",
-    "Docs"
-}
+local search = create("TextBox", {
+    Size = UDim2.new(1, -30, 0, 36),
+    Position = UDim2.fromOffset(15, 190),
+    BackgroundColor3 = Color3.fromRGB(42, 32, 58),
+    TextColor3 = Color3.new(1, 1, 1),
+    PlaceholderText = "Search unit...",
+    Text = "",
+    TextSize = 14
+}, main)
 
-local selected = nil
+local unitList = create("ScrollingFrame", {
+    Size = UDim2.new(1, -30, 0, 100),
+    Position = UDim2.fromOffset(15, 232),
+    BackgroundColor3 = Color3.fromRGB(30, 24, 43),
+    BorderSizePixel = 0,
+    ScrollBarThickness = 4,
+    CanvasSize = UDim2.fromOffset(0, #units * 36)
+}, main)
 
-makeLabel("UNIT SELECTION", 200)
+local layout = create("UIListLayout", {
+    Padding = UDim.new(0, 3)
+}, unitList)
 
-local unitButton = Instance.new("TextButton")
-unitButton.Size = UDim2.new(1, -30, 0, 40)
-unitButton.Position = UDim2.fromOffset(15, 240)
-unitButton.Text = "SELECT UNIT"
-unitButton.BackgroundColor3 = Color3.fromRGB(55, 45, 80)
-unitButton.TextColor3 = Color3.new(1, 1, 1)
-unitButton.Parent = main
+local function refreshUnits()
+    for _, child in ipairs(unitList:GetChildren()) do
+        if child:IsA("TextButton") then
+            child:Destroy()
+        end
+    end
 
-local giveButton = Instance.new("TextButton")
-giveButton.Size = UDim2.new(1, -30, 0, 40)
-giveButton.Position = UDim2.fromOffset(15, 290)
-giveButton.Text = "ADD TO VISUAL INVENTORY"
-giveButton.BackgroundColor3 = Color3.fromRGB(105, 60, 175)
-giveButton.TextColor3 = Color3.new(1, 1, 1)
-giveButton.Parent = main
+    local count = 0
 
-local inventoryLabel = makeLabel("Inventory: Empty", 345)
+    for _, name in ipairs(units) do
+        if string.find(string.lower(name), string.lower(search.Text), 1, true) then
+            count += 1
 
-unitButton.MouseButton1Click:Connect(function()
-    selected = units[math.random(1, #units)]
-    unitButton.Text = selected
-end)
+            local button = create("TextButton", {
+                Size = UDim2.new(1, -6, 0, 32),
+                BackgroundColor3 = Color3.fromRGB(75, 48, 110),
+                Text = name,
+                TextColor3 = Color3.new(1, 1, 1),
+                TextSize = 14,
+                Font = Enum.Font.Gotham
+            }, unitList)
+
+            button.MouseButton1Click:Connect(function()
+                selected = name
+                search.Text = name
+            end)
+        end
+    end
+
+    unitList.CanvasSize = UDim2.fromOffset(0, count * 35)
+end
+
+search:GetPropertyChangedSignal("Text"):Connect(refreshUnits)
+refreshUnits()
+
+local giveButton = create("TextButton", {
+    Size = UDim2.new(1, -30, 0, 35),
+    Position = UDim2.fromOffset(15, 340),
+    BackgroundColor3 = Color3.fromRGB(115, 65, 190),
+    Text = "GIVE",
+    TextColor3 = Color3.new(1, 1, 1),
+    TextSize = 16,
+    Font = Enum.Font.GothamBold
+}, main)
+
+local inventoryLabel = create("TextLabel", {
+    Size = UDim2.new(1, -30, 0, 45),
+    Position = UDim2.fromOffset(15, 380),
+    BackgroundTransparency = 1,
+    Text = "Visual Inventory: Empty",
+    TextColor3 = Color3.new(1, 1, 1),
+    TextSize = 13,
+    Font = Enum.Font.Gotham,
+    TextWrapped = true
+}, main)
 
 giveButton.MouseButton1Click:Connect(function()
-    if selected then
-        table.insert(inventory, selected)
-        inventoryLabel.Text = "Inventory: " .. #inventory .. " units"
+    if not selected then
+        inventoryLabel.Text = "Select a unit first!"
+        return
     end
+
+    table.insert(inventory, selected)
+
+    inventoryLabel.Text =
+        "Visual Inventory: " ..
+        table.concat(inventory, ", ")
 end)
 
-local close = Instance.new("TextButton")
-close.Size = UDim2.fromOffset(30, 30)
-close.Position = UDim2.new(1, -35, 0, 10)
-close.Text = "X"
-close.Parent = main
+local close = create("TextButton", {
+    Size = UDim2.fromOffset(30, 30),
+    Position = UDim2.new(1, -35, 0, 9),
+    BackgroundColor3 = Color3.fromRGB(65, 35, 95),
+    Text = "X",
+    TextColor3 = Color3.new(1, 1, 1),
+    TextSize = 16
+}, main)
 
 close.MouseButton1Click:Connect(function()
     gui.Enabled = false
 end)
 
-gui.Parent = player:WaitForChild("PlayerGui")
-print("PORTAL HUB loaded!")
+print("PORTAL HUB v2.0 loaded")
