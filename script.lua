@@ -1,6 +1,6 @@
 -- language: Lua
 -- target: Roblox client (Portal Tower Defense)
--- AFK farm — timed placement schedule, then upgrade, GUI toggle
+-- non-blocking boot — starts GUI immediately, waits for Towers in background
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -8,15 +8,6 @@ local VirtualUser       = game:GetService("VirtualUser")
 local LocalPlayer       = Players.LocalPlayer
 local PlayerGui         = LocalPlayer:WaitForChild("PlayerGui")
 
-local Remotes = ReplicatedStorage:WaitForChild("Remotes")
-local PlaceTower     = Remotes:WaitForChild("PlaceTower")
-local UpgradeTower   = Remotes:WaitForChild("UpgradeTower")
-local DifficultyVote = Remotes:WaitForChild("DifficultyVote")
-local TowersFolder   = workspace:WaitForChild("Towers")
-
--- ============================================================
--- CONFIG
--- ============================================================
 local CONFIG = {
     Difficulty      = "Nightmare",
     MoneyStatNames  = { "cash", "Cash", "money", "Money" },
@@ -24,13 +15,10 @@ local CONFIG = {
     UpgradeMaxTries = 60,
     ClickInterval   = 5,
     StartTexts      = { "start", "начать", "wave", "волна", "next", "далее", "play", "играть" },
-    PlaceRetryEvery = 1,      -- если отказ — пробовать каждую секунду
-    PlaceMaxWait    = 60,     -- максимум секунд ждать на одну точку
+    PlaceRetryEvery = 1,
+    PlaceMaxWait    = 60,
 }
 
--- ============================================================
--- РАСПИСАНИЕ: { время_от_старта_сек, имя, позиция }
--- ============================================================
 local SCHEDULE = {
     { t = 0,   name = "Jerry",        pos = Vector3.new(115.77935791015625, 7.954591751098633, -46.52529525756836) },
     { t = 0,   name = "Jerry",        pos = Vector3.new(113.5140380859375,  7.933708190917969, -49.838958740234375) },
@@ -39,6 +27,19 @@ local SCHEDULE = {
     { t = 75,  name = "President",    pos = Vector3.new(109.61953735351562, 7.935300827026367, -50.340065002441406) },
     { t = 105, name = "Space Cruiser", pos = Vector3.new(131.7823028564453, 8.261308670043945, -51.3819694519043) },
 }
+
+-- ============================================================
+-- LAZY REMOTE ACCESS — не блокирует, если ремоута ещё нет
+-- ============================================================
+local function GetRemote(name)
+    local r = ReplicatedStorage:FindFirstChild("Remotes")
+    if not r then return nil end
+    local remote = r:FindFirstChild(name)
+    if remote and (remote:IsA("RemoteEvent") or remote:IsA("RemoteFunction")) then
+        return remote
+    end
+    return nil
+end
 
 -- ============================================================
 -- CASH
@@ -53,7 +54,6 @@ local function FindMoneyStat()
     end
     return nil
 end
-
 local function GetMoney()
     if not MoneyStat or not MoneyStat.Parent then MoneyStat = FindMoneyStat() end
     return MoneyStat and MoneyStat.Value or nil
@@ -63,34 +63,37 @@ end
 -- VOTE
 -- ============================================================
 local function VoteDifficulty(diff)
-    pcall(function() DifficultyVote:FireServer(diff) end)
+    local r = GetRemote("DifficultyVote")
+    if not r then warn("[AFK] DifficultyVote не найден"); return end
+    pcall(function() r:FireServer(diff) end)
 end
 
 -- ============================================================
--- PLACE ПО РАСПИСАНИЮ
+-- PLACE
 -- ============================================================
 local function PlaceTimed(entry)
     local start = os.clock()
     local deadline = entry.t + CONFIG.PlaceMaxWait
     local attempt = 0
     while os.clock() < deadline do
-        -- ждём, пока не наступит время
         local now = os.clock() - start
-        if now < entry.t then
-            task.wait(entry.t - now)
+        if now < entry.t then task.wait(entry.t - now) end
+        local r = GetRemote("PlaceTower")
+        if not r then
+            warn("[AFK] PlaceTower не найден, жду...")
+            task.wait(2)
+        else
+            attempt = attempt + 1
+            local ok, ret = pcall(function() return r:InvokeServer(entry.name, entry.pos, 0) end)
+            if ok and ret ~= false and ret ~= nil then
+                print(("[AFK] t+%ds %s поставлен (попытка %d, cash=%s)"):format(entry.t, entry.name, attempt, tostring(GetMoney())))
+                return true
+            end
+            print(("[AFK] t+%ds %s отказ (cash=%s)"):format(entry.t, entry.name, tostring(GetMoney())))
+            task.wait(CONFIG.PlaceRetryEvery)
         end
-        attempt = attempt + 1
-        local ok, ret = pcall(function()
-            return PlaceTower:InvokeServer(entry.name, entry.pos, 0)
-        end)
-        if ok and ret ~= false and ret ~= nil then
-            print(("[AFK] t+%ds %s поставлен (попытка %d, cash=%s)"):format(entry.t, entry.name, attempt, tostring(GetMoney())))
-            return true
-        end
-        print(("[AFK] t+%ds %s отказ (cash=%s), пробую снова..."):format(entry.t, entry.name, tostring(GetMoney())))
-        task.wait(CONFIG.PlaceRetryEvery)
     end
-    warn(("[AFK] %s не поставлен за %d сек"):format(entry.name, CONFIG.PlaceMaxWait))
+    warn(("[AFK] %s не поставлен"):format(entry.name))
     return false
 end
 
@@ -103,30 +106,28 @@ local function PlaceAllTimed()
 end
 
 -- ============================================================
--- UPGRADE (после расстановки)
+-- UPGRADE
 -- ============================================================
 local function FindTowersBySuffix(suffix)
+    local folder = workspace:FindFirstChild("Towers")
+    if not folder then return {} end
     local out = {}
-    for _, obj in ipairs(TowersFolder:GetChildren()) do
+    for _, obj in ipairs(folder:GetChildren()) do
         if obj.Name:sub(-#suffix) == suffix then table.insert(out, obj) end
     end
     return out
 end
 
 local function UpgradeOne(tower)
-    local levels = 0
-    local fails = 0
+    local levels, fails = 0, 0
+    local r = GetRemote("UpgradeTower")
+    if not r then warn("[AFK] UpgradeTower не найден"); return 0 end
     while levels < CONFIG.UpgradeMaxTries and fails < 15 do
-        local ok, ret = pcall(function()
-            return UpgradeTower:InvokeServer(tower)
-        end)
-        if not ok then
-            warn(("[AFK] %s upgrade error: %s"):format(tower.Name, tostring(ret)))
-            break
-        end
+        local ok, ret = pcall(function() return r:InvokeServer(tower) end)
+        if not ok then break end
         if ret == false or ret == nil then
             fails = fails + 1
-            task.wait(2)   -- ждём, пока cash капнет
+            task.wait(2)
         else
             levels = levels + 1
             fails = 0
@@ -140,8 +141,7 @@ end
 local function UpgradeAll()
     for _, suffix in ipairs({ "Jerry", "Buff Turkey", "President", "Space Cruiser" }) do
         for _, t in ipairs(FindTowersBySuffix(suffix)) do
-            local lv = UpgradeOne(t)
-            print(("[AFK] %s итог: +%d"):format(t.Name, lv))
+            print(("[AFK] %s итог: +%d"):format(t.Name, UpgradeOne(t)))
         end
     end
 end
@@ -187,13 +187,10 @@ local function FarmLoop()
         VoteDifficulty(CONFIG.Difficulty)
         task.wait(1)
         if not FarmRunning then break end
-
         PlaceAllTimed()
         if not FarmRunning then break end
-
         UpgradeAll()
         if not FarmRunning then break end
-
         while FarmRunning do
             local btn = FindStartButton()
             if btn and btn.Visible then ClickButton(btn) end
@@ -206,8 +203,7 @@ local function StartFarm()
     if FarmRunning then return end
     FarmRunning = true
     MoneyStat = FindMoneyStat()
-    if MoneyStat then print(("[AFK] cash найден: %d"):format(MoneyStat.Value))
-    else warn("[AFK] cash не найден") end
+    print("[AFK] cash: " .. tostring(MoneyStat and MoneyStat.Value))
     FarmThread = task.spawn(FarmLoop)
     print("[AFK] Фарм запущен")
 end
@@ -263,13 +259,19 @@ local function BuildGui()
 end
 
 -- ============================================================
--- BOOT — автостарт
+-- BOOT — GUI сразу, фарм сам подхватится
 -- ============================================================
 BuildGui()
-local ok = pcall(function() workspace:WaitForChild("Towers", 30) end)
-if ok then
-    task.wait(2)
-    StartFarm()
-else
-    warn("[AFK] Towers не появились — запусти скрипт внутри катки")
-end
+print("[AFK] Меню готово. Жду Towers...")
+
+-- фоновое ожидание папки, не блокирует
+task.spawn(function()
+    local folder = workspace:WaitForChild("Towers", 120)
+    if folder then
+        task.wait(2)
+        if not FarmRunning then StartFarm() end
+        print("[AFK] Автостарт после появления Towers")
+    else
+        warn("[AFK] Towers не появились за 120 сек")
+    end
+end)
