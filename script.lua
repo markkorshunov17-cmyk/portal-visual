@@ -1,6 +1,6 @@
 -- language: Lua
 -- target: Roblox client (Portal Tower Defense)
--- AFK farm with retry logic — placement, upgrade, start-button
+-- AFK farm — leaderstats.money aware, waits for funds, GUI toggle
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -19,14 +19,13 @@ local TowersFolder   = workspace:WaitForChild("Towers")
 -- ============================================================
 local CONFIG = {
     Difficulty      = "Nightmare",
+    MoneyStatName   = "money",   -- имя статы в leaderstats
     PlaceDelay      = 0.3,
-    PlaceRetries    = 5,      -- сколько раз пробовать поставить одну башню
     UpgradeDelay    = 0.15,
-    UpgradeMaxTries = 50,     -- максимум вызовов апгрейда на башню
-    UpgradeRetries  = 3,      -- сколько раз перезапускать апгрейд, если сервер отклонил
+    UpgradeMaxTries = 60,
     ClickInterval   = 5,
-    ClickRetries    = 10,     -- сколько циклов искать кнопку старта, прежде чем сдаться
     StartTexts      = { "start", "начать", "wave", "волна", "next", "далее", "play", "играть" },
+    MoneyWaitTimeout = 120,       -- максимум секунд ждать деньги
 }
 
 local PLACEMENTS = {
@@ -39,58 +38,68 @@ local PLACEMENTS = {
 }
 
 -- ============================================================
--- RETRY HELPERS
+-- LEADERSTATS MONEY
 -- ============================================================
--- Общий ретрай: fn() -> true/false, err. Повторяет до tries раз с паузой.
-local function Retry(fn, tries, delay, label)
-    for i = 1, tries do
-        local ok, result, err = pcall(fn)
-        if ok and result then
-            return true
-        end
-        local reason = (not ok) and tostring(result) or tostring(err or "rejected")
-        warn(("[AFK] %s попытка %d/%d: %s"):format(label or "retry", i, tries, reason))
-        if i < tries then task.wait(delay) end
+local function GetMoney()
+    local ls = LocalPlayer:FindFirstChild("leaderstats")
+    if not ls then return nil end
+    local stat = ls:FindFirstChild(CONFIG.MoneyStatName)
+    if not stat then return nil end
+    return stat.Value
+end
+
+-- Ждём, пока денег станет >= target (или таймаут)
+local function WaitForMoney(target, timeoutSec)
+    timeoutSec = timeoutSec or CONFIG.MoneyWaitTimeout
+    local start = os.clock()
+    while os.clock() - start < timeoutSec do
+        local m = GetMoney()
+        if m and m >= target then return true, m end
+        task.wait(1)
     end
-    return false
+    local m = GetMoney()
+    return false, m
 end
 
 -- ============================================================
 -- VOTE
 -- ============================================================
 local function VoteDifficulty(diff)
-    Retry(function()
+    pcall(function()
         DifficultyVote:FireServer(diff)
-        return true
-    end, 3, 0.5, "vote")
+    end)
 end
 
 -- ============================================================
--- PLACE с ретраями
+-- PLACE — ставим по одному, ждём деньги если отказ
 -- ============================================================
-local function PlaceOne(entry)
-    return Retry(function()
-        -- RemoteFunction возвращает что-то; считаем успехом, если не упало
-        PlaceTower:InvokeServer(entry.name, entry.pos, entry.rot or 0)
-        return true
-    end, CONFIG.PlaceRetries, CONFIG.PlaceDelay, "place " .. entry.name)
-end
-
 local function PlaceAll()
     local placed = 0
-    for _, e in ipairs(PLACEMENTS) do
-        if PlaceOne(e) then
-            placed = placed + 1
-        else
-            warn(("[AFK] Не удалось поставить %s после %d попыток"):format(e.name, CONFIG.PlaceRetries))
+    for i, e in ipairs(PLACEMENTS) do
+        local success = false
+        for attempt = 1, 30 do
+            local ok, ret = pcall(function()
+                return PlaceTower:InvokeServer(e.name, e.pos, e.rot or 0)
+            end)
+            if ok and ret ~= false and ret ~= nil then
+                success = true
+                print(("[AFK] %s поставлен (%d/%d)"):format(e.name, i, #PLACEMENTS))
+                break
+            end
+            -- отказ: ждём деньги и пробуем снова
+            local before = GetMoney()
+            print(("[AFK] %s отказ. Баланс: %s. Ждём..."):format(e.name, tostring(before)))
+            WaitForMoney((before or 0) + 1, 30)   -- ждём, пока баланс хоть немного вырастет
         end
+        if success then placed = placed + 1
+        else warn(("[AFK] %s не поставлен после 30 попыток"):format(e.name)) end
         task.wait(CONFIG.PlaceDelay)
     end
-    print(("[AFK] Расставлено: %d/%d"):format(placed, #PLACEMENTS))
+    print(("[AFK] Итого: %d/%d"):format(placed, #PLACEMENTS))
 end
 
 -- ============================================================
--- UPGRADE с ретраями
+-- UPGRADE — качаем, ждём деньги при отказе
 -- ============================================================
 local function FindTowersBySuffix(suffix)
     local out = {}
@@ -100,43 +109,43 @@ local function FindTowersBySuffix(suffix)
     return out
 end
 
--- Один проход апгрейда: долбит до максимума или до отказа
-local function UpgradePass(tower)
-    local tries = 0
-    while tries < CONFIG.UpgradeMaxTries do
+local function UpgradeOne(tower)
+    local levels = 0
+    local fails = 0
+    while levels < CONFIG.UpgradeMaxTries and fails < 10 do
         local ok, ret = pcall(function()
             return UpgradeTower:InvokeServer(tower)
         end)
-        if not ok then return false, tostring(ret) end
-        if ret == false then return false, "server rejected" end
-        tries = tries + 1
+        if not ok then
+            warn(("[AFK] %s upgrade error: %s"):format(tower.Name, tostring(ret)))
+            break
+        end
+        if ret == false or ret == nil then
+            fails = fails + 1
+            local before = GetMoney()
+            print(("[AFK] %s уровень %d отказ. Баланс: %s. Ждём..."):format(tower.Name, levels + 1, tostring(before)))
+            WaitForMoney((before or 0) + 1, 20)
+        else
+            levels = levels + 1
+            fails = 0
+            print(("[AFK] %s -> уровень %d"):format(tower.Name, levels + 1))
+        end
         task.wait(CONFIG.UpgradeDelay)
     end
-    return true
-end
-
--- Апгрейд с ретраями: если проход упал — пробуем ещё раз
-local function UpgradeOne(tower)
-    for i = 1, CONFIG.UpgradeRetries do
-        local ok, reason = UpgradePass(tower)
-        if ok then return true end
-        warn(("[AFK] upgrade %s попытка %d/%d: %s"):format(tower.Name, i, CONFIG.UpgradeRetries, reason))
-        task.wait(0.5)
-    end
-    return false
+    return levels
 end
 
 local function UpgradeAll()
     for _, suffix in ipairs({ "Jerry", "Buff Turkey", "President", "Space Cruiser" }) do
         for _, t in ipairs(FindTowersBySuffix(suffix)) do
-            local ok = UpgradeOne(t)
-            print(("[AFK] %s: %s"):format(t.Name, ok and "ok" or "не прокачан"))
+            local lv = UpgradeOne(t)
+            print(("[AFK] %s итог: +%d уровней"):format(t.Name, lv))
         end
     end
 end
 
 -- ============================================================
--- AUTO-CLICK с ретраями
+-- AUTO-CLICK START
 -- ============================================================
 local function FindStartButton()
     for _, gui in ipairs(PlayerGui:GetChildren()) do
@@ -184,19 +193,9 @@ local function FarmLoop()
         UpgradeAll()
         if not FarmRunning then break end
 
-        -- авто-клик с ретраем поиска кнопки
-        local misses = 0
         while FarmRunning do
             local btn = FindStartButton()
-            if btn and btn.Visible then
-                ClickButton(btn)
-                misses = 0
-            else
-                misses = misses + 1
-                if misses == CONFIG.ClickRetries then
-                    warn(("[AFK] Кнопка старта не найдена после %d попыток — проверь UI через Dex"):format(misses))
-                end
-            end
+            if btn and btn.Visible then ClickButton(btn) end
             task.wait(CONFIG.ClickInterval)
         end
     end
@@ -205,6 +204,10 @@ end
 local function StartFarm()
     if FarmRunning then return end
     FarmRunning = true
+    -- проверка money при старте
+    local m = GetMoney()
+    if m then print(("[AFK] Баланс на старте: %d"):format(m))
+    else warn("[AFK] leaderstats.money не найден — проверь имя статы") end
     FarmThread = task.spawn(FarmLoop)
     print("[AFK] Фарм запущен")
 end
@@ -291,4 +294,4 @@ local function BuildGui()
 end
 
 BuildGui()
-print("[AFK] Меню готово. ВКЛ / ВЫКЛ.")
+print("[AFK] Меню готово. ВКЛ / ВЫКЛ. Money stat: " .. CONFIG.MoneyStatName)
