@@ -1,6 +1,6 @@
 -- language: Lua
 -- target: Roblox client (Portal Tower Defense)
--- AFK farm — ordered placement, balance probe, GUI toggle
+-- AFK farm with retry logic — placement, upgrade, start-button
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -20,13 +20,15 @@ local TowersFolder   = workspace:WaitForChild("Towers")
 local CONFIG = {
     Difficulty      = "Nightmare",
     PlaceDelay      = 0.3,
+    PlaceRetries    = 5,      -- сколько раз пробовать поставить одну башню
     UpgradeDelay    = 0.15,
-    UpgradeMaxTries = 50,
+    UpgradeMaxTries = 50,     -- максимум вызовов апгрейда на башню
+    UpgradeRetries  = 3,      -- сколько раз перезапускать апгрейд, если сервер отклонил
     ClickInterval   = 5,
+    ClickRetries    = 10,     -- сколько циклов искать кнопку старта, прежде чем сдаться
     StartTexts      = { "start", "начать", "wave", "волна", "next", "далее", "play", "играть" },
 }
 
--- ПОРЯДОК: Jerry → Buff Turkey → President x2 → Space Cruiser
 local PLACEMENTS = {
     { name = "Jerry",        pos = Vector3.new(115.77935791015625, 7.954591751098633, -46.52529525756836), rot = 0 },
     { name = "Jerry",        pos = Vector3.new(113.5140380859375,  7.933708190917969, -49.838958740234375), rot = 0 },
@@ -37,93 +39,59 @@ local PLACEMENTS = {
 }
 
 -- ============================================================
--- BALANCE PROBE (универсальный поиск денег)
+-- RETRY HELPERS
 -- ============================================================
-local CachedBalance = nil
-
-local function FindBalance()
-    -- 1) leaderstats
-    local ls = LocalPlayer:FindFirstChild("leaderstats")
-    if ls then
-        for _, v in ipairs(ls:GetChildren()) do
-            if v:IsA("IntValue") or v:IsA("NumberValue") then
-                local n = v.Name:lower()
-                if n:find("coin") or n:find("cash") or n:find("money") or n:find("gold") then
-                    return v
-                end
-            end
+-- Общий ретрай: fn() -> true/false, err. Повторяет до tries раз с паузой.
+local function Retry(fn, tries, delay, label)
+    for i = 1, tries do
+        local ok, result, err = pcall(fn)
+        if ok and result then
+            return true
         end
+        local reason = (not ok) and tostring(result) or tostring(err or "rejected")
+        warn(("[AFK] %s попытка %d/%d: %s"):format(label or "retry", i, tries, reason))
+        if i < tries then task.wait(delay) end
     end
-    -- 2) атрибуты игрока
-    for _, attr in ipairs(LocalPlayer:GetAttributes()) do
-        local n = attr:lower()
-        if n:find("coin") or n:find("cash") or n:find("money") or n:find("gold") then
-            return { Attribute = attr }
-        end
-    end
-    -- 3) папка PlayerData / Stats
-    for _, container in ipairs({ LocalPlayer, PlayerGui }) do
-        for _, obj in ipairs(container:GetDescendants()) do
-            if (obj:IsA("IntValue") or obj:IsA("NumberValue")) then
-                local n = obj.Name:lower()
-                if n:find("coin") or n:find("cash") or n:find("money") or n:find("gold") then
-                    return obj
-                end
-            end
-        end
-    end
-    return nil
-end
-
-local function GetBalance()
-    if not CachedBalance then return nil end
-    local ok, val = pcall(function()
-        if type(CachedBalance) == "table" and CachedBalance.Attribute then
-            return LocalPlayer:GetAttribute(CachedBalance.Attribute)
-        else
-            return CachedBalance.Value
-        end
-    end)
-    if ok then return val end
-    return nil
-end
-
-local function StartBalanceWatch()
-    CachedBalance = FindBalance()
-    if not CachedBalance then
-        warn("[AFK] Баланс не найден — проверка счёта отключена")
-        return
-    end
-    print("[AFK] Баланс найден: " .. tostring(GetBalance()))
-    -- слушаем изменения, если это объект
-    if type(CachedBalance) ~= "table" then
-        pcall(function()
-            CachedBalance:GetPropertyChangedSignal("Value"):Connect(function()
-                print(("[AFK] Баланс: %s"):format(tostring(CachedBalance.Value)))
-            end)
-        end)
-    end
+    return false
 end
 
 -- ============================================================
--- VOTE + PLACE + UPGRADE (без изменений)
+-- VOTE
 -- ============================================================
 local function VoteDifficulty(diff)
-    pcall(function() return DifficultyVote:FireServer(diff) end)
+    Retry(function()
+        DifficultyVote:FireServer(diff)
+        return true
+    end, 3, 0.5, "vote")
+end
+
+-- ============================================================
+-- PLACE с ретраями
+-- ============================================================
+local function PlaceOne(entry)
+    return Retry(function()
+        -- RemoteFunction возвращает что-то; считаем успехом, если не упало
+        PlaceTower:InvokeServer(entry.name, entry.pos, entry.rot or 0)
+        return true
+    end, CONFIG.PlaceRetries, CONFIG.PlaceDelay, "place " .. entry.name)
 end
 
 local function PlaceAll()
     local placed = 0
     for _, e in ipairs(PLACEMENTS) do
-        local ok = pcall(function()
-            return PlaceTower:InvokeServer(e.name, e.pos, e.rot or 0)
-        end)
-        if ok then placed = placed + 1 end
+        if PlaceOne(e) then
+            placed = placed + 1
+        else
+            warn(("[AFK] Не удалось поставить %s после %d попыток"):format(e.name, CONFIG.PlaceRetries))
+        end
         task.wait(CONFIG.PlaceDelay)
     end
     print(("[AFK] Расставлено: %d/%d"):format(placed, #PLACEMENTS))
 end
 
+-- ============================================================
+-- UPGRADE с ретраями
+-- ============================================================
 local function FindTowersBySuffix(suffix)
     local out = {}
     for _, obj in ipairs(TowersFolder:GetChildren()) do
@@ -132,7 +100,8 @@ local function FindTowersBySuffix(suffix)
     return out
 end
 
-local function UpgradeOne(tower)
+-- Один проход апгрейда: долбит до максимума или до отказа
+local function UpgradePass(tower)
     local tries = 0
     while tries < CONFIG.UpgradeMaxTries do
         local ok, ret = pcall(function()
@@ -146,17 +115,28 @@ local function UpgradeOne(tower)
     return true
 end
 
+-- Апгрейд с ретраями: если проход упал — пробуем ещё раз
+local function UpgradeOne(tower)
+    for i = 1, CONFIG.UpgradeRetries do
+        local ok, reason = UpgradePass(tower)
+        if ok then return true end
+        warn(("[AFK] upgrade %s попытка %d/%d: %s"):format(tower.Name, i, CONFIG.UpgradeRetries, reason))
+        task.wait(0.5)
+    end
+    return false
+end
+
 local function UpgradeAll()
     for _, suffix in ipairs({ "Jerry", "Buff Turkey", "President", "Space Cruiser" }) do
         for _, t in ipairs(FindTowersBySuffix(suffix)) do
-            local ok, reason = UpgradeOne(t)
-            print(("[AFK] %s: %s"):format(t.Name, ok and "ok" or reason))
+            local ok = UpgradeOne(t)
+            print(("[AFK] %s: %s"):format(t.Name, ok and "ok" or "не прокачан"))
         end
     end
 end
 
 -- ============================================================
--- AUTO-CLICK
+-- AUTO-CLICK с ретраями
 -- ============================================================
 local function FindStartButton()
     for _, gui in ipairs(PlayerGui:GetChildren()) do
@@ -186,7 +166,7 @@ local function ClickButton(btn)
 end
 
 -- ============================================================
--- FARM LOOP (управляемый кнопкой GUI)
+-- FARM LOOP
 -- ============================================================
 local FarmRunning = false
 local FarmThread = nil
@@ -196,14 +176,27 @@ local function FarmLoop()
         VoteDifficulty(CONFIG.Difficulty)
         task.wait(1)
         if not FarmRunning then break end
+
         PlaceAll()
         task.wait(1)
         if not FarmRunning then break end
+
         UpgradeAll()
-        -- авто-клик старта волны
+        if not FarmRunning then break end
+
+        -- авто-клик с ретраем поиска кнопки
+        local misses = 0
         while FarmRunning do
             local btn = FindStartButton()
-            if btn and btn.Visible then ClickButton(btn) end
+            if btn and btn.Visible then
+                ClickButton(btn)
+                misses = 0
+            else
+                misses = misses + 1
+                if misses == CONFIG.ClickRetries then
+                    warn(("[AFK] Кнопка старта не найдена после %d попыток — проверь UI через Dex"):format(misses))
+                end
+            end
             task.wait(CONFIG.ClickInterval)
         end
     end
@@ -212,7 +205,6 @@ end
 local function StartFarm()
     if FarmRunning then return end
     FarmRunning = true
-    StartBalanceWatch()
     FarmThread = task.spawn(FarmLoop)
     print("[AFK] Фарм запущен")
 end
@@ -299,4 +291,4 @@ local function BuildGui()
 end
 
 BuildGui()
-print("[AFK] Меню готово. Нажми ВКЛ для запуска.")
+print("[AFK] Меню готово. ВКЛ / ВЫКЛ.")
