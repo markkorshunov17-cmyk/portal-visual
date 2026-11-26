@@ -1,6 +1,6 @@
-
 -- language: Lua
--- target: Roblox client (Portal Tower Defense) — compact AFK farm v2
+-- target: Roblox client (Portal Tower Defense) — compact AFK farm v4
+-- randomized delays to reduce pattern detection, no autostart
 
 local P  = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
@@ -13,7 +13,7 @@ local DIFF    = "Nightmare"
 local REMOTES = { "PlaceTower", "UpgradeTower", "DifficultyVote" }
 local COST    = { Jerry=250, ["Buff Turkey"]=800, President=1600, ["Space Cruiser"]=2200 }
 local UPG     = { Jerry={450,1100,2400,4800} }
-local TARGET_LV = 4
+local TARGET_LV = 5
 local ST_TX   = { "start","начать","wave","волна" }
 local EX_TX   = { "again","replay","level","lvl","уровень","exit","выход","leave","покинуть","заново" }
 
@@ -31,6 +31,7 @@ local startFarm, stopFarm
 local st = {phase="idle", detail="", tEnd=0, tName="", err=""}
 
 local function el() return os.clock() - matchStart end
+local function rnd(a, b) return a + math.random() * (b - a) end
 
 local function findCash()
   local ls = LP:FindFirstChild("leaderstats"); if not ls then return nil end
@@ -57,7 +58,7 @@ local function buildGui()
   f.BackgroundColor3=Color3.fromRGB(14,14,18); f.BorderSizePixel=0; f.Active=true; f.Draggable=true; f.Parent=gui
   Instance.new("UICorner",f).CornerRadius=UDim.new(0,10)
   local tl = Instance.new("TextLabel"); tl.Size=UDim2.new(1,-16,0,22); tl.Position=UDim2.new(0,8,0,4)
-  tl.BackgroundTransparency=1; tl.Text="PTD AFK v2"; tl.TextColor3=Color3.fromRGB(0,220,110)
+  tl.BackgroundTransparency=1; tl.Text="PTD AFK v4"; tl.TextColor3=Color3.fromRGB(0,220,110)
   tl.Font=Enum.Font.GothamBold; tl.TextSize=13; tl.TextXAlignment=Enum.TextXAlignment.Left; tl.Parent=f
   btn = Instance.new("TextButton"); btn.Size=UDim2.new(1,-32,0,30); btn.Position=UDim2.new(0,16,0,30)
   btn.BorderSizePixel=0; btn.Text="START"; btn.TextColor3=Color3.new(1,1,1); btn.Font=Enum.Font.GothamBold
@@ -103,7 +104,7 @@ local function waitCash(need, label)
     local c = cash()
     if c and c >= need then return true end
     st.detail = ("wait %d (have %s) %s"):format(need, tostring(c or "?"), label or "")
-    task.wait(0.5)
+    task.wait(rnd(0.5, 0.9))
   end
 end
 
@@ -120,7 +121,8 @@ local function placeOne(e)
     local ok, ret = pcall(r.InvokeServer, r, e.n, e.p, 0)
     print(("[DBG] %s cost=%d ok=%s ret=%s cash=%s"):format(e.n,cost,tostring(ok),tostring(ret),tostring(cash())))
     if ok and ret ~= false then return true end
-    task.wait(0.5)
+    -- отказ: пауза, чтобы не выглядеть как спам
+    task.wait(rnd(1.5, 2.5))
   end
 end
 
@@ -151,30 +153,24 @@ local function baseName(n)
 end
 
 -- ============================================================
--- UPGRADE: общий пул, качаем что доступно, до TARGET_LV
+-- UPGRADE: общий пул, чёрный список на отказ, до TARGET_LV
 -- ============================================================
-local function gatherTargets()
-  local list = {}
-  for _, s in ipairs({"Jerry","Buff Turkey","President","Space Cruiser"}) do
-    for _, t in ipairs(towers(s)) do
-      list[#list+1] = {tower=t, base=s, lv=1}
-    end
-  end
-  return list
-end
-
 local function upgradeLoop()
   local r = remote("UpgradeTower"); if not r then return end
-  local targets = gatherTargets()
+  local targets = {}
+  for _, s in ipairs({"Jerry","Buff Turkey","President","Space Cruiser"}) do
+    for _, t in ipairs(towers(s)) do
+      targets[#targets+1] = {tower=t, base=s, lv=1, blockUntil=0}
+    end
+  end
   local total = 0
 
   while running do
-    local didSomething = false
-
-    -- ищем самый дешёвый доступный апгрейд
+    local now = os.clock()
     local best, bestNeed = nil, math.huge
+
     for _, ent in ipairs(targets) do
-      if ent.lv < TARGET_LV and ent.tower.Parent then
+      if ent.lv < TARGET_LV and ent.tower.Parent and now >= ent.blockUntil then
         local costs = UPG[ent.base]
         local need = costs and costs[ent.lv] or 0
         local c = cash() or 0
@@ -185,7 +181,6 @@ local function upgradeLoop()
     end
 
     if not best then
-      -- ничего не доступно: ждём деньги или выходим, если всё на TARGET_LV
       local anyLeft = false
       for _, ent in ipairs(targets) do
         if ent.lv < TARGET_LV and ent.tower.Parent then anyLeft = true; break end
@@ -194,30 +189,34 @@ local function upgradeLoop()
       local c = cash() or 0
       local minNeed = math.huge
       for _, ent in ipairs(targets) do
-        if ent.lv < TARGET_LV and ent.tower.Parent then
+        if ent.lv < TARGET_LV and ent.tower.Parent and now >= ent.blockUntil then
           local costs = UPG[ent.base]
           local need = costs and costs[ent.lv] or 0
           if need < minNeed then minNeed = need end
         end
       end
       st.detail = ("wait for %d (have %d)"):format(minNeed, c)
-      task.wait(1)
+      task.wait(rnd(0.8, 1.4))
     else
       st.detail = ("upgrade %s to L%d"):format(best.tower.Name, best.lv+1)
       local ok, ret = pcall(r.InvokeServer, r, best.tower)
       if ok and ret ~= false and ret ~= nil then
         best.lv = best.lv + 1
         total = total + 1
-        didSomething = true
         print(("[AFK] %s -> L%d"):format(best.tower.Name, best.lv))
       else
-        -- отказ: возможно максимум или денег мало, пропускаем на секунду
-        task.wait(1.5)
+        best.blockUntil = now + 5
+        print(("[AFK] %s refused at L%d, skip 5s"):format(best.tower.Name, best.lv+1))
+        task.wait(rnd(0.5, 1.0))
       end
-      task.wait(0.12)
-    end
 
-    if not running then break end
+      -- человеческая пауза после серии апгрейдов
+      if total > 0 and total % 6 == 0 then
+        task.wait(rnd(2.0, 4.0))
+      else
+        task.wait(rnd(0.15, 0.30))
+      end
+    end
   end
 
   print(("[AFK] upgrades total +%d"):format(total))
@@ -261,13 +260,13 @@ local function loop()
     st.detail = "wait remotes: "..table.concat(miss,","); task.wait(1)
   end
   if not running then return end
-  task.wait(2)
+  task.wait(rnd(2, 3))
   if not running then return end
 
   st.phase = "vote"
   local dv = remote("DifficultyVote")
   if dv then pcall(function() dv:FireServer(DIFF) end) end
-  task.wait(1.5)
+  task.wait(rnd(1.5, 2.5))
   if not running then return end
 
   st.phase = "place"
@@ -278,6 +277,7 @@ local function loop()
   upgradeLoop()
   if not running then return end
 
+  -- после апгрейда: 5 попыток найти кнопку старта, потом стоп
   st.phase = "click"
   local misses = 0
   while running do
@@ -285,10 +285,14 @@ local function loop()
     if b then clickB(b); misses = 0
     else
       misses = misses + 1
-      st.detail = ("no start btn (%d/15)"):format(misses)
-      if misses >= 15 then st.err = "match ended"; running = false; break end
+      st.detail = ("no start btn (%d/5)"):format(misses)
+      if misses >= 5 then
+        st.err = "match ended — жми START в новой катке"
+        running = false
+        break
+      end
     end
-    task.wait(4)
+    task.wait(rnd(3, 4.5))
   end
 end
 
@@ -307,5 +311,6 @@ stopFarm = function()
   st.phase, st.detail, st.tEnd, st.tName = "idle", "stopped", 0, ""
 end
 
+-- ТОЛЬКО МЕНЮ, НИКАКОГО АВТОСТАРТА
 local ok, err = pcall(buildGui)
-if ok then print("[AFK] ready. START.") else warn("[AFK] GUI fail: "..tostring(err)) end
+if ok then print("[AFK] ready. Жми START вручную.") else warn("[AFK] GUI fail: "..tostring(err)) end
